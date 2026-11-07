@@ -88,6 +88,12 @@ The emulator core only knows the **original Game Boy**. I found no Game Boy Colo
 
 The ROM cache now uses **4 KB pages** instead of 16 KB banks (same RAM, 4x more entries, each SD read about 4x cheaper). Games with big ROMs that used to drop to a few fps should improve a lot. This needs a **firmware rebuild** (C module changed) together with the new `emulators/gb.py`; the old `gb.py` will not work with the new firmware and the other way round.
 
+## Direct SD reads (new)
+
+ROM pages are now read straight from the SD card by the C module (the ROM file's sectors are looked up once when the game starts and checked against a normal read). This removes most of the Python driver's overhead. The Diagnostics screen shows *Odczyt SD: bezpośredni* when it is active; *przez Pythona* means it fell back to the old path (e.g. a card formatted with clusters smaller than 4 KB, or a file system problem), which still works, just slower. Try `GB_SD_BAUD = 20_000_000` (or 25 MHz) in `config.py` for faster transfers; go back down if you get read errors.
+
+For the screen wait: pause menu -> *Skala* 1x and *Zegar ekranu* SZYBKI cut the display time a lot.
+
 ## Limits
 
 - No sound.

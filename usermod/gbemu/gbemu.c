@@ -30,6 +30,9 @@
 #include "py/mperrno.h"
 #include "py/mphal.h"
 
+#include "extmod/vfs_fat.h"
+#include "lib/oofatfs/ff.h"
+
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/dma.h"
@@ -85,6 +88,12 @@ typedef struct _gbe_obj_t {
     bool hw, dma_busy;
     spi_inst_t *spi;
     unsigned dc, cs;
+    // direct SD reads (bypass the Python SD driver): see gbe_sd_direct()
+    bool sd_ok, sd_contig;
+    spi_inst_t *sd_spi;
+    unsigned sd_cs;
+    uint32_t sd_cdv, sd_base, sd_cl_bytes, sd_cl_sec;
+    uint32_t *sd_table;
     uint32_t st_loads, st_load_us, st_wait_us;
     uint16_t sbuf[2][GBE_STRIP * 240];
 } gbe_obj_t;
@@ -119,6 +128,92 @@ static void gbe_read_at(gbe_obj_t *self, uint32_t offset, uint8_t *dst, uint32_t
     }
 }
 
+// ------------------------------------------------------------------ direct SD reading
+// The ROM file's sectors on the card are looked up once (from FatFS's own file object), then
+// pages are read with CMD18 straight over the SD card's SPI bus from C. This avoids the Python
+// SD driver (about 3 ms of interpreter overhead per 4 KB). Any problem -> falls back to the
+// normal file reads.
+
+typedef struct _gbe_fat_file_t {   // same layout as pyb_file_obj_t in extmod/vfs_fat_file.c
+    mp_obj_base_t base;
+    FIL fp;
+} gbe_fat_file_t;
+
+static bool gbe_sd_cmd12(gbe_obj_t *self) {
+    uint8_t c[6] = {0x4C, 0, 0, 0, 0, 0xFF};
+    uint8_t b = 0xFF;
+    spi_write_blocking(self->sd_spi, c, 6);
+    spi_read_blocking(self->sd_spi, 0xFF, &b, 1);  // stuff byte
+    for (int i = 0; i < 16; i++) {
+        spi_read_blocking(self->sd_spi, 0xFF, &b, 1);
+        if (!(b & 0x80)) {
+            break;
+        }
+    }
+    uint32_t t0 = mp_hal_ticks_us();
+    do {
+        spi_read_blocking(self->sd_spi, 0xFF, &b, 1);
+    } while (b != 0xFF && (mp_hal_ticks_us() - t0) < 200000);
+    return b == 0xFF;
+}
+
+static bool gbe_sd_read(gbe_obj_t *self, uint32_t sector, uint8_t *dst, uint32_t nsec) {
+    spi_inst_t *spi = self->sd_spi;
+    uint32_t arg = sector * self->sd_cdv;
+    uint8_t c[6] = {0x40 | 18, arg >> 24, arg >> 16, arg >> 8, arg, 0xFF};
+    uint8_t b = 0xFF;
+    gpio_put(self->sd_cs, 0);
+    spi_write_blocking(spi, c, 6);
+    for (int i = 0; i < 16; i++) {
+        spi_read_blocking(spi, 0xFF, &b, 1);
+        if (!(b & 0x80)) {
+            break;
+        }
+    }
+    bool ok = (b == 0);
+    for (uint32_t i = 0; ok && i < nsec; i++) {
+        uint32_t t0 = mp_hal_ticks_us();
+        do {
+            spi_read_blocking(spi, 0xFF, &b, 1);
+        } while (b == 0xFF && (mp_hal_ticks_us() - t0) < 100000);
+        if (b != 0xFE) {
+            ok = false;
+            break;
+        }
+        spi_read_blocking(spi, 0xFF, dst + i * 512, 512);
+        uint8_t crc[2];
+        spi_read_blocking(spi, 0xFF, crc, 2);
+    }
+    if (!gbe_sd_cmd12(self)) {
+        ok = false;
+    }
+    gpio_put(self->sd_cs, 1);
+    uint8_t ff = 0xFF;
+    spi_write_blocking(spi, &ff, 1);
+    return ok;
+}
+
+// read one page of the ROM; false -> caller must use the normal path
+static bool gbe_sd_page(gbe_obj_t *self, uint32_t page, uint8_t *dst) {
+    uint32_t off = page << GBE_PSHIFT;
+    if (off >= self->rom_size) {
+        return false;
+    }
+    uint32_t sec;
+    if (self->sd_contig) {
+        sec = self->sd_base + (off >> 9);
+    } else {
+        sec = self->sd_table[off / self->sd_cl_bytes] + ((off % self->sd_cl_bytes) >> 9);
+    }
+    if (!gbe_sd_read(self, sec, dst, GBE_PAGE / 512)) {
+        return false;
+    }
+    if (off + GBE_PAGE > self->rom_size) {
+        memset(dst + (self->rom_size - off), 0xFF, off + GBE_PAGE - self->rom_size);
+    }
+    return true;
+}
+
 static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
     int slot = (int)self->ptab[page] - 1;
     if (slot < 0) {
@@ -141,7 +236,11 @@ static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
         }
         self->slot_page[slot] = -1;  // stays invalid if the read below raises
         uint32_t t0 = mp_hal_ticks_us();
-        gbe_read_at(self, page << GBE_PSHIFT, self->cache + (size_t)slot * GBE_PAGE, GBE_PAGE);
+        uint8_t *dst = self->cache + (size_t)slot * GBE_PAGE;
+        if (!(self->sd_ok && gbe_sd_page(self, page, dst))) {
+            self->sd_ok = false;
+            gbe_read_at(self, page << GBE_PSHIFT, dst, GBE_PAGE);
+        }
         self->st_load_us += mp_hal_ticks_us() - t0;
         self->st_loads++;
         self->slot_page[slot] = (int32_t)page;
@@ -424,6 +523,73 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     return MP_OBJ_FROM_PTR(self);
 }
 
+// sd_direct(spi_id, cs_pin, cdv) -> bool: switch ROM page reads to direct SD access.
+// Returns False (and keeps the normal path) if anything does not check out.
+static mp_obj_t gbe_sd_direct(size_t n_args, const mp_obj_t *args) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    self->sd_ok = false;
+    if (!mp_obj_is_type(self->file, &mp_type_vfs_fat_fileio)) {
+        return mp_const_false;
+    }
+    FIL *fp = &((gbe_fat_file_t *)MP_OBJ_TO_PTR(self->file))->fp;
+    FATFS *fs = fp->obj.fs;
+    if (fs == NULL) {
+        return mp_const_false;
+    }
+    uint32_t ss = 512;
+    #if FF_MAX_SS != FF_MIN_SS
+    ss = fs->ssize;
+    #endif
+    uint32_t cl_bytes = (uint32_t)fs->csize * ss;
+    if (ss != 512 || cl_bytes < GBE_PAGE || (cl_bytes & (GBE_PAGE - 1))) {
+        return mp_const_false;
+    }
+    self->sd_spi = mp_obj_get_int(args[1]) ? spi1 : spi0;
+    self->sd_cs = mp_obj_get_int(args[2]);
+    self->sd_cdv = mp_obj_get_int(args[3]);
+    self->sd_cl_bytes = cl_bytes;
+
+    // sector of every cluster of the file (f_lseek to byte 1 of a cluster leaves fp->sect = its first sector)
+    uint32_t ncl = (self->rom_size + cl_bytes - 1) / cl_bytes;
+    uint32_t *tab = m_new(uint32_t, ncl);
+    for (uint32_t i = 0; i < ncl; i++) {
+        if (f_lseek(fp, (FSIZE_t)i * cl_bytes + 1) != FR_OK || fp->sect == 0) {
+            return mp_const_false;
+        }
+        tab[i] = (uint32_t)fp->sect;
+    }
+    bool contig = true;
+    for (uint32_t i = 1; i < ncl; i++) {
+        if (tab[i] != tab[0] + i * fs->csize) {
+            contig = false;
+            break;
+        }
+    }
+    self->sd_contig = contig;
+    self->sd_base = tab[0];
+    self->sd_table = contig ? NULL : tab;
+
+    // verify against the normal path: first page (bank 0 is already loaded) and, if there
+    // is room for a second buffer, the last page
+    uint8_t *tmp = self->cache;
+    if (!gbe_sd_page(self, 0, tmp) || memcmp(tmp, self->bank0, GBE_PAGE) != 0) {
+        return mp_const_false;
+    }
+    if (self->npages > 1 && self->nslots >= 2) {
+        uint32_t pg = self->npages - 1;
+        if (!gbe_sd_page(self, pg, tmp)) {
+            return mp_const_false;
+        }
+        gbe_read_at(self, pg << GBE_PSHIFT, tmp + GBE_PAGE, GBE_PAGE);
+        if (memcmp(tmp, tmp + GBE_PAGE, GBE_PAGE) != 0) {
+            return mp_const_false;
+        }
+    }
+    self->sd_ok = true;
+    return mp_const_true;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_sd_direct_obj, 4, 4, gbe_sd_direct);
+
 // display(callback, x, y, mode) - Python blit fallback: callback(buf, x, y, w, h)
 static mp_obj_t gbe_display(size_t n_args, const mp_obj_t *args) {
     gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
@@ -590,6 +756,7 @@ static mp_obj_t gbe_title(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_title_obj, gbe_title);
 
 static const mp_rom_map_elem_t gbe_locals_table[] = {
+    {MP_ROM_QSTR(MP_QSTR_sd_direct), MP_ROM_PTR(&gbe_sd_direct_obj)},
     {MP_ROM_QSTR(MP_QSTR_display), MP_ROM_PTR(&gbe_display_obj)},
     {MP_ROM_QSTR(MP_QSTR_display_hw), MP_ROM_PTR(&gbe_display_hw_obj)},
     {MP_ROM_QSTR(MP_QSTR_palette), MP_ROM_PTR(&gbe_palette_obj)},

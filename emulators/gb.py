@@ -187,6 +187,12 @@ def run(tos, path=None):
             tos.message("Game Boy", "Za mało wolnej pamięci RAM: wolne %d KB, potrzeba ok. %d KB. Zobacz BUILD.md (zamroź system / zbuduj dla RPI_PICO)." % (gc.mem_free() // 1024, need), tos.RED)
             return
 
+        direct = False
+        if path.startswith("/sd") and tos.sd is not None and hasattr(emu, "sd_direct"):
+            try:
+                direct = emu.sd_direct(getattr(config, "SD_SPI_ID", 0), config.SD_CS, tos.sd.cdv)
+            except Exception:
+                direct = False
         sav = path.rpartition(".")[0] + ".sav"
         has_ram = emu.ram() is not None
         title = emu.title() or "Game Boy"
@@ -264,9 +270,9 @@ def run(tos, path=None):
                     set_clock(bool(st["oc"]))
                 elif what == "diag":
                     tos.message("Diagnostyka",
-                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nWolny RAM: %d KB\nZegar: %d MHz" % (
+                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nWolny RAM: %d KB\nZegar: %d MHz\nOdczyt SD: %s" % (
                                     diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4,
-                                    gc.mem_free() // 1024, freq() // 1000000))
+                                    gc.mem_free() // 1024, freq() // 1000000, "bezpośredni" if direct else "przez Pythona"))
                 elif what == "quit":
                     if tos.confirm("Zakończyć grę?"):
                         return "quit"
