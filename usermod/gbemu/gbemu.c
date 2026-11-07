@@ -37,6 +37,8 @@
 #include "hardware/spi.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
+#include "hardware/clocks.h"
+#include "py/gc.h"
 #include "hardware/sync.h"
 
 #define ENABLE_LCD 1
@@ -71,7 +73,7 @@ typedef struct _gbe_obj_t {
     mp_obj_t draw;
     uint32_t rom_size;
     uint8_t *bank0;
-    uint8_t *cache;
+    uint8_t **slot_buf;       // one separate 4 KB block per cache slot (heap fragmentation friendly)
     int nslots;
     int32_t *slot_page;       // page held by each cache slot (-1 = empty)
     uint32_t *slot_use;
@@ -93,7 +95,7 @@ typedef struct _gbe_obj_t {
     volatile bool dma_busy;
     // display queue: rendered strips wait in `ring` and a DMA interrupt sends them one after
     // another, so the emulator can carry on (even into the next frame) while the screen is fed
-    uint16_t *ring;
+    uint16_t *ring_buf[GBE_RMAX];
     int ring_n;
     int s_nl[GBE_RMAX], s_y0[GBE_RMAX];
     volatile uint32_t q_head, q_tail;
@@ -246,7 +248,7 @@ static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
         }
         self->slot_page[slot] = -1;  // stays invalid if the read below raises
         uint32_t t0 = mp_hal_ticks_us();
-        uint8_t *dst = self->cache + (size_t)slot * GBE_PAGE;
+        uint8_t *dst = self->slot_buf[slot];
         if (!(self->sd_ok && gbe_sd_page(self, page, dst))) {
             self->sd_ok = false;
             gbe_read_at(self, page << GBE_PSHIFT, dst, GBE_PAGE);
@@ -258,7 +260,7 @@ static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
     }
     self->slot_use[slot] = ++self->tick;
     self->last_page = (int32_t)page;
-    self->last_ptr = self->cache + (size_t)slot * GBE_PAGE;
+    self->last_ptr = self->slot_buf[slot];
     return self->last_ptr;
 }
 
@@ -280,7 +282,7 @@ static GBE_HOT uint8_t gbe_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
     if (slot) {
         self->slot_use[slot - 1] = ++self->tick;
         self->last_page = (int32_t)page;
-        self->last_ptr = self->cache + (size_t)(slot - 1) * GBE_PAGE;
+        self->last_ptr = self->slot_buf[slot - 1];
         return self->last_ptr[addr & (GBE_PAGE - 1)];
     }
     return gbe_load_page(self, page)[addr & (GBE_PAGE - 1)];
@@ -342,7 +344,7 @@ static GBE_HOT void gbe_start_next(gbe_obj_t *self) {
     int outw = self->mode == 0 ? 160 : 240;
     int nl = self->s_nl[slot];
     int y0 = self->s_y0[slot];
-    uint16_t *buf = self->ring + (size_t)slot * GBE_STRIP * 240;
+    uint16_t *buf = self->ring_buf[slot];
     uint8_t d[4];
     int x0 = self->ox;
     int x1 = x0 + outw - 1;
@@ -418,7 +420,7 @@ static GBE_HOT void gbe_flush(gbe_obj_t *self) {
     }
     int outw = self->mode == 0 ? 160 : 240;
     int slot = (int)(self->q_tail % (uint32_t)self->ring_n);
-    uint16_t *buf = self->ring + (size_t)slot * GBE_STRIP * 240;
+    uint16_t *buf = self->ring_buf[slot];
     int nl = self->pending;
     int y0 = self->oy + self->pend_y;
     self->pending = 0;
@@ -455,7 +457,7 @@ static GBE_HOT void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const u
         gbe_wait_slot(self);
     }
     const uint16_t *lut = self->lut;
-    uint16_t *base = self->ring + (size_t)(self->hw ? self->q_tail % (uint32_t)self->ring_n : 0) * GBE_STRIP * 240;
+    uint16_t *base = self->ring_buf[self->hw ? self->q_tail % (uint32_t)self->ring_n : 0];
     if (self->mode == 0) {
         if (self->pending == 0) {
             self->pend_y = line;
@@ -561,9 +563,36 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     }
     int strips = a[ARG_strips].u_int;
     strips = strips < 2 ? 2 : (strips > GBE_RMAX ? GBE_RMAX : strips);
-    self->ring_n = strips;
-    self->ring = m_new(uint16_t, (size_t)strips * GBE_STRIP * 240);
-    self->cache = m_new(uint8_t, (size_t)slots * GBE_PAGE);
+    // Cache pages and display strips are separate small heap blocks, taken best-effort: a
+    // fragmented heap can still give many 4 KB pieces where one big block would fail.
+    self->slot_buf = m_new(uint8_t *, slots);
+    int got = 0;
+    while (got < slots) {
+        uint8_t *pg = m_new_maybe(uint8_t, GBE_PAGE);
+        if (pg == NULL) {
+            break;
+        }
+        self->slot_buf[got++] = pg;
+    }
+    int rn = 0;
+    while (rn < strips) {
+        uint16_t *st = m_new_maybe(uint16_t, GBE_STRIP * 240);
+        if (st == NULL) {
+            if (rn < 2 && got > 4) {   // strips matter more than the last cache pages
+                self->slot_buf[--got] = NULL;
+                gc_collect();
+                continue;
+            }
+            break;
+        }
+        self->ring_buf[rn++] = st;
+    }
+    if (got < 4 || rn < 2) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("not enough RAM for the Game Boy"));
+    }
+    slots = got;
+    self->nslots = got;
+    self->ring_n = rn;
     self->slot_page = m_new(int32_t, slots);
     self->slot_use = m_new(uint32_t, slots);
     self->ptab = m_new(uint16_t, self->npages);
@@ -642,7 +671,8 @@ static mp_obj_t gbe_sd_direct(size_t n_args, const mp_obj_t *args) {
 
     // verify against the normal path: first page (bank 0 is already loaded) and, if there
     // is room for a second buffer, the last page
-    uint8_t *tmp = self->cache;
+    uint8_t *tmp = self->slot_buf[0];
+    uint8_t *tmp2 = self->slot_buf[1];
     if (!gbe_sd_page(self, 0, tmp) || memcmp(tmp, self->bank0, GBE_PAGE) != 0) {
         return mp_const_false;
     }
@@ -651,8 +681,8 @@ static mp_obj_t gbe_sd_direct(size_t n_args, const mp_obj_t *args) {
         if (!gbe_sd_page(self, pg, tmp)) {
             return mp_const_false;
         }
-        gbe_read_at(self, pg << GBE_PSHIFT, tmp + GBE_PAGE, GBE_PAGE);
-        if (memcmp(tmp, tmp + GBE_PAGE, GBE_PAGE) != 0) {
+        gbe_read_at(self, pg << GBE_PSHIFT, tmp2, GBE_PAGE);
+        if (memcmp(tmp, tmp2, GBE_PAGE) != 0) {
             return mp_const_false;
         }
     }
@@ -698,6 +728,11 @@ static mp_obj_t gbe_display_hw(size_t n_args, const mp_obj_t *args) {
     self->oy = mp_obj_get_int(args[5]);
     self->mode = mp_obj_get_int(args[6]) ? 1 : 0;
     int baud = mp_obj_get_int(args[7]);
+    // make sure the peripheral clock follows the system clock (SPI baud rates derive from it)
+    uint32_t sysf = clock_get_hz(clk_sys);
+    if (clock_get_hz(clk_peri) != sysf) {
+        clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, sysf, sysf);
+    }
     if (baud > 0) {
         spi_set_baudrate(self->spi, (unsigned)baud);
     }
@@ -789,11 +824,20 @@ static mp_obj_t gbe_sync(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_sync_obj, gbe_sync);
 
+// info() -> (cache pages, display strips) actually allocated
+static mp_obj_t gbe_info(mp_obj_t self_in) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_obj_t t[2] = {MP_OBJ_NEW_SMALL_INT(self->nslots), MP_OBJ_NEW_SMALL_INT(self->ring_n)};
+    return mp_obj_new_tuple(2, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(gbe_info_obj, gbe_info);
+
 // stats() -> (rom bank loads, microseconds spent loading, microseconds waiting for the display)
 // and resets the counters.
 static mp_obj_t gbe_stats(mp_obj_t self_in) {
     gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_obj_t t[5];
+    mp_obj_t t[6];
+    t[5] = mp_obj_new_int_from_uint(clock_get_hz(clk_peri) / 1000000);
     t[3] = mp_obj_new_int_from_uint(self->st_drawn);
     t[4] = mp_obj_new_int_from_uint(self->hw ? spi_get_baudrate(self->spi) : 0);
     self->st_drawn = 0;
@@ -803,7 +847,7 @@ static mp_obj_t gbe_stats(mp_obj_t self_in) {
     self->st_loads = 0;
     self->st_load_us = 0;
     self->st_wait_us = 0;
-    return mp_obj_new_tuple(5, t);
+    return mp_obj_new_tuple(6, t);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_stats_obj, gbe_stats);
 
@@ -843,6 +887,7 @@ static mp_obj_t gbe_title(mp_obj_t self_in) {
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_title_obj, gbe_title);
 
 static const mp_rom_map_elem_t gbe_locals_table[] = {
+    {MP_ROM_QSTR(MP_QSTR_info), MP_ROM_PTR(&gbe_info_obj)},
     {MP_ROM_QSTR(MP_QSTR_sd_direct), MP_ROM_PTR(&gbe_sd_direct_obj)},
     {MP_ROM_QSTR(MP_QSTR_display), MP_ROM_PTR(&gbe_display_obj)},
     {MP_ROM_QSTR(MP_QSTR_display_hw), MP_ROM_PTR(&gbe_display_hw_obj)},
