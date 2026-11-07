@@ -105,7 +105,7 @@ typedef struct _gbe_obj_t {
     unsigned sd_cs;
     uint32_t sd_cdv, sd_base, sd_cl_bytes, sd_cl_sec;
     uint32_t *sd_table;
-    uint32_t st_loads, st_load_us, st_wait_us;
+    uint32_t st_loads, st_load_us, st_wait_us, st_drawn, st_strips;
 } gbe_obj_t;
 
 extern const mp_obj_type_t gbe_type;
@@ -424,6 +424,7 @@ static GBE_HOT void gbe_flush(gbe_obj_t *self) {
     self->pending = 0;
 
     if (self->hw) {
+        self->st_strips++;
         self->s_nl[slot] = nl;
         self->s_y0[slot] = y0;
         uint32_t irq = save_and_disable_interrupts();
@@ -770,6 +771,10 @@ static mp_obj_t gbe_frame(size_t n_args, const mp_obj_t *args) {
     self->pending = 0;
     gb_run_frame(&self->gb);
     gbe_flush(self);
+    if (self->hw && self->st_strips) {
+        self->st_drawn++;
+    }
+    self->st_strips = 0;
     // the queue keeps draining in the background; call sync() before touching the display from Python
     return mp_const_none;
 }
@@ -788,14 +793,17 @@ static MP_DEFINE_CONST_FUN_OBJ_1(gbe_sync_obj, gbe_sync);
 // and resets the counters.
 static mp_obj_t gbe_stats(mp_obj_t self_in) {
     gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    mp_obj_t t[3];
+    mp_obj_t t[5];
+    t[3] = mp_obj_new_int_from_uint(self->st_drawn);
+    t[4] = mp_obj_new_int_from_uint(self->hw ? spi_get_baudrate(self->spi) : 0);
+    self->st_drawn = 0;
     t[0] = mp_obj_new_int_from_uint(self->st_loads);
     t[1] = mp_obj_new_int_from_uint(self->st_load_us);
     t[2] = mp_obj_new_int_from_uint(self->st_wait_us);
     self->st_loads = 0;
     self->st_load_us = 0;
     self->st_wait_us = 0;
-    return mp_obj_new_tuple(3, t);
+    return mp_obj_new_tuple(5, t);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_stats_obj, gbe_stats);
 

@@ -168,10 +168,14 @@ def run(tos, path=None):
             free = gc.mem_free()
             table = 2 * 4 * banks                    # page table of the C module
             avail = free - CORE_BYTES - ram - RESERVE - table
-            # display queue: more strips = emulator waits less for the screen; ROM cache keeps >= 20 pages
-            strips = 14
-            while strips > 2 and (avail - (strips - 2) * STRIP_BYTES) // (PAGE + 8) < 20:
-                strips -= 2
+            # The ROM cache comes first: too few cache pages means constant SD reads (that is what
+            # made the first queue version slow). The display queue only gets what is left over
+            # above a comfortable cache. Override with GB_STRIPS (2 = no queue) in config.py.
+            want = max(2, min(14, getattr(config, "GB_STRIPS", 4)))
+            keep = min(60, (banks - 1) * 4)          # cache pages we try to protect
+            strips = want
+            while strips > 2 and (avail - (strips - 2) * STRIP_BYTES) // (PAGE + 8) < keep:
+                strips -= 1
             slots = (avail - (strips - 2) * STRIP_BYTES) // (PAGE + 8)
             slots = max(4, min(slots, (banks - 1) * 4, 250))
         except Exception:
@@ -207,7 +211,7 @@ def run(tos, path=None):
         has_ram = emu.ram() is not None
         title = emu.title() or "Game Boy"
         _load_save(emu, sav)
-        diag = [0, 0, 0, 0]          # fps, bank loads/s, ms loading/s, ms waiting for display/s
+        diag = [0, 0, 0, 0, 0, 0]          # fps, bank loads/s, ms loading/s, ms waiting for display/s
 
         def setup():
             w, h = tos.W, tos.H
@@ -280,8 +284,8 @@ def run(tos, path=None):
                     set_clock(bool(st["oc"]))
                 elif what == "diag":
                     tos.message("Diagnostyka",
-                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nKolejka ekranu: %d pasków\nWolny RAM: %d KB\nZegar: %d MHz\nOdczyt SD: %s" % (
-                                    diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4, strips,
+                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nRysowane klatki: %d/s\nZegar SPI ekranu: %d MHz\nKolejka ekranu: %d pasków\nWolny RAM: %d KB\nZegar: %d MHz\nOdczyt SD: %s" % (
+                                    diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4, diag[4], diag[5], strips,
                                     gc.mem_free() // 1024, freq() // 1000000, "bezpośredni" if direct else "przez Pythona"))
                 elif what == "quit":
                     if tos.confirm("Zakończyć grę?"):
@@ -345,11 +349,13 @@ def run(tos, path=None):
             fcount += 1
             dt = time.ticks_diff(now, t_fps)
             if dt >= 1000:
-                loads, load_us, wait_us = emu.stats()
+                loads, load_us, wait_us, drawn, baud = emu.stats()
                 diag[0] = fcount * 1000 // dt
                 diag[1] = loads * 1000 // dt
                 diag[2] = load_us // dt
                 diag[3] = wait_us // dt
+                diag[4] = drawn * 1000 // dt
+                diag[5] = baud // 1000000
                 fcount = 0
                 t_fps = now
 
