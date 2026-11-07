@@ -726,7 +726,7 @@ static mp_obj_t gbe_ram(mp_obj_t self_in) {
     if (!self->ram_size) {
         return mp_const_none;
     }
-    return mp_obj_new_memoryview('B', self->ram_size, self->ram);
+    return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW, self->ram_size, self->ram);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(gbe_ram_obj, gbe_ram);
 
