@@ -180,6 +180,7 @@ class XMB:
             out.append(("Odwróć kolory", (lambda: tos.toggle_setting("invert")), onoff(s["invert"])))
             out.append(("Kolejność kolorów", (lambda: tos.toggle_setting("bgr")), "BGR" if s["bgr"] else "RGB"))
             out.append(("Obróć ekran", (lambda: tos.toggle_setting("rot")), "TAK" if s["rot"] == 3 else "NIE"))
+            out.append(("Turbo 250 MHz", (lambda: tos.toggle_setting("turbo")), onoff(s.get("turbo", 1))))
             out.append(("Ekran startowy", (lambda: tos.toggle_setting("splash")), onoff(s.get("splash", 1))))
             out.append(("Test kolorów", tos.color_test, ""))
         else:

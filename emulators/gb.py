@@ -48,9 +48,10 @@ PALETTES = (
 
 # RAM the emulator needs besides the ROM bank cache: Peanut-GB state (~17 KB) + display
 # strip buffers (~8 KB) + bank 0 (16 KB); RESERVE is left for Python (menus, saving ...).
-CORE_BYTES = 41 * 1024
+CORE_BYTES = 61 * 1024      # includes ~20 KB for emulator code that runs from RAM
 RESERVE = 14 * 1024
 BANK = 16384
+STRIP_BYTES = 3840           # one display strip (8 lines of 240 pixels)
 PAGE = 4096                  # ROM cache page size used by the C module
 RAM_SIZES = (0, 2048, 8192, 32768, 32768, 32768)   # header code -> bytes (capped at 32 KB)
 
@@ -58,7 +59,7 @@ RAM_SIZES = (0, 2048, 8192, 32768, 32768, 32768)   # header code -> bytes (cappe
 def _set_clock(tos, hz):
     freq(hz)
     # SPI baud rates are derived from the system clock: re-apply them after a change
-    tos.lcd.spi.init(baudrate=config.SPI_BAUD)
+    tos.lcd.spi.init(baudrate=tos.spi_baud() if hasattr(tos, "spi_baud") else config.SPI_BAUD)
     if tos.sd:
         tos.sd.spi.init(baudrate=getattr(config, "GB_SD_BAUD", 16_000_000), phase=0, polarity=0)
 
@@ -150,6 +151,7 @@ def run(tos, path=None):
     orig_hz = freq()
     clocked = False
     slots = 0
+    strips = 2
     try:
         # Game Boy Color-only games (header byte 0x143 = 0xC0) cannot run on this DMG emulator
         try:
@@ -165,20 +167,28 @@ def run(tos, path=None):
             banks, ram = _plan(f)
             free = gc.mem_free()
             table = 2 * 4 * banks                    # page table of the C module
-            slots = (free - CORE_BYTES - ram - RESERVE - table) // (PAGE + 8)
+            avail = free - CORE_BYTES - ram - RESERVE - table
+            # display queue: more strips = emulator waits less for the screen; ROM cache keeps >= 20 pages
+            strips = 14
+            while strips > 2 and (avail - (strips - 2) * STRIP_BYTES) // (PAGE + 8) < 20:
+                strips -= 2
+            slots = (avail - (strips - 2) * STRIP_BYTES) // (PAGE + 8)
             slots = max(4, min(slots, (banks - 1) * 4, 250))
         except Exception:
-            banks, ram, slots = 2, 0, 16
+            banks, ram, slots, strips = 2, 0, 16, 2
         try:
             while True:
                 try:
-                    emu = gbemu.Emu(f, slots)
+                    emu = gbemu.Emu(f, slots, strips)
                     break
                 except MemoryError:
                     gc.collect()
-                    if slots <= 4:
+                    if strips > 2:
+                        strips = max(2, strips - 4)
+                    elif slots <= 4:
                         break
-                    slots -= 4
+                    else:
+                        slots -= 4
         except ValueError as e:
             tos.message("Game Boy", str(e), tos.RED)
             return
@@ -270,8 +280,8 @@ def run(tos, path=None):
                     set_clock(bool(st["oc"]))
                 elif what == "diag":
                     tos.message("Diagnostyka",
-                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nWolny RAM: %d KB\nZegar: %d MHz\nOdczyt SD: %s" % (
-                                    diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4,
+                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nKolejka ekranu: %d pasków\nWolny RAM: %d KB\nZegar: %d MHz\nOdczyt SD: %s" % (
+                                    diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4, strips,
                                     gc.mem_free() // 1024, freq() // 1000000, "bezpośredni" if direct else "przez Pythona"))
                 elif what == "quit":
                     if tos.confirm("Zakończyć grę?"):
@@ -366,7 +376,7 @@ def run(tos, path=None):
             if clocked:
                 _set_clock(tos, orig_hz)
             else:
-                tos.lcd.spi.init(baudrate=config.SPI_BAUD)
+                tos.lcd.spi.init(baudrate=tos.spi_baud())
         except Exception:
             pass
         f.close()

@@ -14,6 +14,10 @@ on:
         description: "Freeze the TinyOS system files into the firmware (saves a lot of RAM)"
         type: boolean
         default: true
+      ram_code:
+        description: "Run the emulator core from RAM instead of flash (faster; costs about 20 KB of RAM)"
+        type: boolean
+        default: true
       micropython_ref:
         description: MicroPython tag or branch to build
         default: v1.24.1
@@ -39,6 +43,12 @@ jobs:
           curl -fL -o usermod/gbemu/peanut_gb.h https://raw.githubusercontent.com/deltabeard/Peanut-GB/v1.2.0/peanut_gb.h \
             || curl -fL -o usermod/gbemu/peanut_gb.h https://raw.githubusercontent.com/deltabeard/Peanut-GB/master/peanut_gb.h
           wc -l usermod/gbemu/peanut_gb.h
+
+      - name: Place the hot emulator functions in RAM
+        if: ${{ inputs.ram_code != false }}
+        run: |
+          sed -i -E 's/^((static )?(inline )?(void|uint8_t|uint_fast8_t|uint_fast16_t) +)(__gb_read|__gb_write|__gb_execute_cb|__gb_draw_line|__gb_step_cpu|gb_run_frame)\(/__attribute__((section(".time_critical.gbemu"))) \1\5(/' usermod/gbemu/peanut_gb.h
+          echo "functions moved to RAM:"; grep -c 'time_critical.gbemu' usermod/gbemu/peanut_gb.h || true
 
       - name: Build mpy-cross
         run: make -C micropython/mpy-cross -j4

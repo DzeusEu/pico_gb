@@ -94,6 +94,12 @@ ROM pages are now read straight from the SD card by the C module (the ROM file's
 
 For the screen wait: pause menu -> *Skala* 1x and *Zegar ekranu* SZYBKI cut the display time a lot.
 
+## Faster emulation and menus (new)
+
+- **Display queue.** Rendered strips of the picture now wait in a queue and a DMA interrupt sends them one after another, so the emulator no longer stalls while the screen is fed, and keeps running into the next frame. The queue size depends on free RAM (Diagnostics shows *Kolejka ekranu*).
+- **Emulator core in RAM.** The workflow option `ram_code` (default on) moves the hot Peanut-GB functions from flash to RAM, which usually speeds the CPU emulation up noticeably. It costs about 20 KB of RAM; switch it off if a game complains about memory.
+- **Turbo 250 MHz** (Ustawienia, default on): the whole system, including the XMB menu animation, runs at 250 MHz with the display clock at 62.5 MHz (`SPI_BAUD_TURBO` in `config.py` if you want another value). Switch it off if you get glitches.
+
 ## Limits
 
 - No sound.

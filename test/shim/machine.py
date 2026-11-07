@@ -25,5 +25,5 @@ class SPI:
     def write(self, data):
         if SPI.LCD is not None:
             SPI.LCD.write(bytes(data))
-def freq(): return 125000000
+def freq(hz=None): return 125000000
 def reset(): raise SystemExit("reset")

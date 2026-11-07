@@ -16,6 +16,7 @@ from st7789 import ST7789, rgb
 OS_NAME = "RTSP_OS"
 VERSION = "0.3"
 SD_DIR = "/sd"
+TURBO_HZ = 250_000_000
 HEADER_H = 20
 FOOTER_H = 16
 ROW_H = 16
@@ -68,14 +69,16 @@ class System:
 
         # settings (saved in /data/settings.json, defaults from config.py)
         self.s = {"sound": 1, "invert": 1 if config.LCD_INVERT else 0,
-                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION, "splash": 1}
+                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION, "splash": 1, "turbo": 1}
         saved = self.load("settings", None)
         if isinstance(saved, dict):
             for k in self.s:
                 if k in saved:
                     self.s[k] = saved[k]
 
-        spi = SPI(config.SPI_ID, baudrate=config.SPI_BAUD, polarity=0, phase=0,
+        if self.s.get("turbo", 1):
+            freq(TURBO_HZ)   # menus and Python code run about twice as fast
+        spi = SPI(config.SPI_ID, baudrate=self.spi_baud(), polarity=0, phase=0,
                   sck=Pin(config.PIN_SCK), mosi=Pin(config.PIN_MOSI))
         rst = Pin(config.PIN_RST, Pin.OUT) if config.PIN_RST is not None else None
         self.lcd = ST7789(spi, Pin(config.PIN_DC, Pin.OUT), Pin(config.PIN_CS, Pin.OUT),
@@ -91,6 +94,17 @@ class System:
         self.sd = None
         self.sd_error = ""
         self.sd_mount()
+
+    def spi_baud(self):
+        if self.s.get("turbo", 1):
+            return getattr(config, "SPI_BAUD_TURBO", 62_500_000)
+        return config.SPI_BAUD
+
+    def apply_clock(self):
+        freq(TURBO_HZ if self.s.get("turbo", 1) else 125_000_000)
+        self.lcd.spi.init(baudrate=self.spi_baud())
+        if self.sd:
+            self.sd.spi.init(baudrate=getattr(config, "SD_BAUD", 10_000_000), phase=0, polarity=0)
 
     # ------------------------------------------------------------ SD card
     def sd_mount(self):
@@ -505,6 +519,9 @@ class System:
         elif name == "rot":
             s["rot"] = 1 if s["rot"] == 3 else 3
             self.lcd.set_rotation(s["rot"], bool(s["bgr"]))
+        elif name == "turbo":
+            s["turbo"] = 0 if s.get("turbo", 1) else 1
+            self.apply_clock()
         elif name == "splash":
             s["splash"] = 0 if s.get("splash", 1) else 1
         self.save_settings()

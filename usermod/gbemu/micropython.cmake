@@ -14,6 +14,6 @@ target_include_directories(usermod_gbemu INTERFACE
 set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/gbemu.c PROPERTIES COMPILE_OPTIONS "-O3;-w")
 
 # SPI + DMA are used to stream frames to the display
-target_link_libraries(usermod_gbemu INTERFACE hardware_dma hardware_spi hardware_clocks hardware_timer)
+target_link_libraries(usermod_gbemu INTERFACE hardware_dma hardware_spi hardware_clocks hardware_timer hardware_irq hardware_sync)
 
 target_link_libraries(usermod INTERFACE usermod_gbemu)

@@ -36,6 +36,8 @@
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
 #include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
 
 #define ENABLE_LCD 1
 #define ENABLE_SOUND 0
@@ -47,6 +49,8 @@
 #define GBE_PSHIFT 12
 #define GBE_MAXS 250            // max cache pages
 #define GBE_STRIP 8             // lines per display strip buffer
+#define GBE_RMAX 24             // max strips in the display queue
+#define GBE_HOT __attribute__((section(".time_critical.gbemu")))  // run from RAM, not flash
 #define GBE_MAX_RAM 32768
 
 // button bits expected from Python (same as buttons.py)
@@ -84,8 +88,15 @@ typedef struct _gbe_obj_t {
     uint16_t lut[64];
     int ox, oy, mode;
     bool draw_on;
-    int pending, pend_y, cur;
-    bool hw, dma_busy;
+    int pending, pend_y;
+    bool hw;
+    volatile bool dma_busy;
+    // display queue: rendered strips wait in `ring` and a DMA interrupt sends them one after
+    // another, so the emulator can carry on (even into the next frame) while the screen is fed
+    uint16_t *ring;
+    int ring_n;
+    int s_nl[GBE_RMAX], s_y0[GBE_RMAX];
+    volatile uint32_t q_head, q_tail;
     spi_inst_t *spi;
     unsigned dc, cs;
     // direct SD reads (bypass the Python SD driver): see gbe_sd_direct()
@@ -95,7 +106,6 @@ typedef struct _gbe_obj_t {
     uint32_t sd_cdv, sd_base, sd_cl_bytes, sd_cl_sec;
     uint32_t *sd_table;
     uint32_t st_loads, st_load_us, st_wait_us;
-    uint16_t sbuf[2][GBE_STRIP * 240];
 } gbe_obj_t;
 
 extern const mp_obj_type_t gbe_type;
@@ -254,7 +264,7 @@ static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
 
 // ------------------------------------------------------------------ Peanut-GB callbacks
 
-static uint8_t gbe_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
+static GBE_HOT uint8_t gbe_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
     gbe_obj_t *self = (gbe_obj_t *)gb->direct.priv;
     if (addr < GBE_BANK) {
         return self->bank0[addr];
@@ -276,12 +286,12 @@ static uint8_t gbe_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
     return gbe_load_page(self, page)[addr & (GBE_PAGE - 1)];
 }
 
-static uint8_t gbe_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr) {
+static GBE_HOT uint8_t gbe_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr) {
     gbe_obj_t *self = (gbe_obj_t *)gb->direct.priv;
     return addr < self->ram_size ? self->ram[addr] : 0xFF;
 }
 
-static void gbe_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val) {
+static GBE_HOT void gbe_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val) {
     gbe_obj_t *self = (gbe_obj_t *)gb->direct.priv;
     if (addr < self->ram_size && self->ram[addr] != val) {
         self->ram[addr] = val;
@@ -298,24 +308,8 @@ static void gbe_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t
 
 // ------------------------------------------------------------------ display output
 
-// Wait for a running strip transfer (and the SPI shift register) to finish, release CS.
-static void gbe_dma_wait(gbe_obj_t *self) {
-    if (!self->dma_busy) {
-        return;
-    }
-    uint32_t t0 = mp_hal_ticks_us();
-    dma_channel_wait_for_finish_blocking((uint)gbe_dma);
-    while (spi_get_hw(self->spi)->sr & SPI_SSPSR_BSY_BITS) {
-        tight_loop_contents();
-    }
-    while (spi_is_readable(self->spi)) {
-        (void)spi_get_hw(self->spi)->dr;
-    }
-    spi_get_hw(self->spi)->icr = SPI_SSPICR_RORIC_BITS;
-    gpio_put(self->cs, 1);
-    self->dma_busy = false;
-    self->st_wait_us += mp_hal_ticks_us() - t0;
-}
+static gbe_obj_t *gbe_active = NULL;
+static bool gbe_irq_ready = false;
 
 static void gbe_cmd(gbe_obj_t *self, uint8_t cmd, const uint8_t *data, size_t n) {
     gpio_put(self->cs, 0);
@@ -328,48 +322,116 @@ static void gbe_cmd(gbe_obj_t *self, uint8_t cmd, const uint8_t *data, size_t n)
     gpio_put(self->cs, 1);
 }
 
-static void gbe_flush(gbe_obj_t *self) {
+static void gbe_spi_idle(gbe_obj_t *self) {
+    while (spi_get_hw(self->spi)->sr & SPI_SSPSR_BSY_BITS) {
+        tight_loop_contents();
+    }
+    while (spi_is_readable(self->spi)) {
+        (void)spi_get_hw(self->spi)->dr;
+    }
+    spi_get_hw(self->spi)->icr = SPI_SSPICR_RORIC_BITS;
+}
+
+// Start sending the oldest queued strip (call with interrupts off or from the DMA handler).
+static GBE_HOT void gbe_start_next(gbe_obj_t *self) {
+    if (self->q_head == self->q_tail) {
+        self->dma_busy = false;
+        return;
+    }
+    int slot = (int)(self->q_head % (uint32_t)self->ring_n);
+    int outw = self->mode == 0 ? 160 : 240;
+    int nl = self->s_nl[slot];
+    int y0 = self->s_y0[slot];
+    uint16_t *buf = self->ring + (size_t)slot * GBE_STRIP * 240;
+    uint8_t d[4];
+    int x0 = self->ox;
+    int x1 = x0 + outw - 1;
+    d[0] = x0 >> 8;
+    d[1] = x0 & 0xFF;
+    d[2] = x1 >> 8;
+    d[3] = x1 & 0xFF;
+    gbe_cmd(self, 0x2A, d, 4);
+    int y1 = y0 + nl - 1;
+    d[0] = y0 >> 8;
+    d[1] = y0 & 0xFF;
+    d[2] = y1 >> 8;
+    d[3] = y1 & 0xFF;
+    gbe_cmd(self, 0x2B, d, 4);
+    const uint8_t ramwr = 0x2C;
+    gpio_put(self->cs, 0);
+    gpio_put(self->dc, 0);
+    spi_write_blocking(self->spi, &ramwr, 1);
+    gpio_put(self->dc, 1);
+    dma_channel_config c = dma_channel_get_default_config((uint)gbe_dma);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_dreq(&c, spi_get_dreq(self->spi, true));
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    dma_channel_configure((uint)gbe_dma, &c, &spi_get_hw(self->spi)->dr, buf,
+        (uint32_t)(nl * outw * 2), true);
+    self->dma_busy = true;
+}
+
+static GBE_HOT void gbe_dma_irq(void) {
+    gbe_obj_t *self = gbe_active;
+    if (self == NULL || !dma_channel_get_irq1_status((uint)gbe_dma)) {
+        return;
+    }
+    dma_channel_acknowledge_irq1((uint)gbe_dma);
+    gbe_spi_idle(self);          // last bytes shifted out
+    gpio_put(self->cs, 1);
+    self->q_head++;
+    gbe_start_next(self);
+}
+
+// Wait until every queued strip has been sent and the bus is idle.
+static void gbe_dma_wait(gbe_obj_t *self) {
+    if (!self->hw) {
+        return;
+    }
+    uint32_t t0 = mp_hal_ticks_us();
+    bool waited = false;
+    while (self->q_head != self->q_tail || self->dma_busy) {
+        waited = true;
+        tight_loop_contents();
+    }
+    if (waited) {
+        self->st_wait_us += mp_hal_ticks_us() - t0;
+    }
+}
+
+// Producer: make sure the strip we are about to render into is not still queued.
+static GBE_HOT void gbe_wait_slot(gbe_obj_t *self) {
+    if (self->q_tail - self->q_head < (uint32_t)self->ring_n) {
+        return;
+    }
+    uint32_t t0 = mp_hal_ticks_us();
+    while (self->q_tail - self->q_head >= (uint32_t)self->ring_n) {
+        tight_loop_contents();
+    }
+    self->st_wait_us += mp_hal_ticks_us() - t0;
+}
+
+static GBE_HOT void gbe_flush(gbe_obj_t *self) {
     if (self->pending == 0) {
         return;
     }
     int outw = self->mode == 0 ? 160 : 240;
-    uint16_t *buf = self->sbuf[self->cur];
+    int slot = (int)(self->q_tail % (uint32_t)self->ring_n);
+    uint16_t *buf = self->ring + (size_t)slot * GBE_STRIP * 240;
     int nl = self->pending;
     int y0 = self->oy + self->pend_y;
     self->pending = 0;
 
     if (self->hw) {
-        gbe_dma_wait(self);  // previous strip must be out before we touch the bus again
-        uint8_t d[4];
-        int x0 = self->ox;
-        int x1 = x0 + outw - 1;
-        d[0] = x0 >> 8;
-        d[1] = x0 & 0xFF;
-        d[2] = x1 >> 8;
-        d[3] = x1 & 0xFF;
-        gbe_cmd(self, 0x2A, d, 4);
-        int y1 = y0 + nl - 1;
-        d[0] = y0 >> 8;
-        d[1] = y0 & 0xFF;
-        d[2] = y1 >> 8;
-        d[3] = y1 & 0xFF;
-        gbe_cmd(self, 0x2B, d, 4);
-
-        // RAM write command, then stream the pixels with CS held low
-        const uint8_t ramwr = 0x2C;
-        gpio_put(self->cs, 0);
-        gpio_put(self->dc, 0);
-        spi_write_blocking(self->spi, &ramwr, 1);
-        gpio_put(self->dc, 1);
-        dma_channel_config c = dma_channel_get_default_config((uint)gbe_dma);
-        channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-        channel_config_set_dreq(&c, spi_get_dreq(self->spi, true));
-        channel_config_set_read_increment(&c, true);
-        channel_config_set_write_increment(&c, false);
-        dma_channel_configure((uint)gbe_dma, &c, &spi_get_hw(self->spi)->dr, buf,
-            (uint32_t)(nl * outw * 2), true);
-        self->dma_busy = true;
-        self->cur ^= 1;  // keep rendering into the other buffer
+        self->s_nl[slot] = nl;
+        self->s_y0[slot] = y0;
+        uint32_t irq = save_and_disable_interrupts();
+        self->q_tail++;
+        if (!self->dma_busy) {
+            gbe_start_next(self);
+        }
+        restore_interrupts(irq);
         return;
     }
 
@@ -383,13 +445,16 @@ static void gbe_flush(gbe_obj_t *self) {
     mp_call_function_n_kw(self->draw, 5, 0, args);
 }
 
-static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line) {
+static GBE_HOT void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line) {
     gbe_obj_t *self = (gbe_obj_t *)gb->direct.priv;
     if (!self->draw_on || (!self->hw && self->draw == mp_const_none)) {
         return;
     }
+    if (self->pending == 0 && self->hw) {
+        gbe_wait_slot(self);
+    }
     const uint16_t *lut = self->lut;
-    uint16_t *base = self->sbuf[self->cur];
+    uint16_t *base = self->ring + (size_t)(self->hw ? self->q_tail % (uint32_t)self->ring_n : 0) * GBE_STRIP * 240;
     if (self->mode == 0) {
         if (self->pending == 0) {
             self->pend_y = line;
@@ -439,10 +504,11 @@ static uint32_t gbe_ram_size(const uint8_t *hdr) {
 // ------------------------------------------------------------------ Python API
 
 static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
-    enum { ARG_file, ARG_slots };
+    enum { ARG_file, ARG_slots, ARG_strips };
     static const mp_arg_t allowed[] = {
         {MP_QSTR_file, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_slots, MP_ARG_INT, {.u_int = 16}},
+        {MP_QSTR_strips, MP_ARG_INT, {.u_int = 2}},
     };
     mp_arg_val_t a[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, args, MP_ARRAY_SIZE(allowed), allowed, a);
@@ -492,6 +558,10 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
         slots = (int)self->npages;
         self->nslots = slots;
     }
+    int strips = a[ARG_strips].u_int;
+    strips = strips < 2 ? 2 : (strips > GBE_RMAX ? GBE_RMAX : strips);
+    self->ring_n = strips;
+    self->ring = m_new(uint16_t, (size_t)strips * GBE_STRIP * 240);
     self->cache = m_new(uint8_t, (size_t)slots * GBE_PAGE);
     self->slot_page = m_new(int32_t, slots);
     self->slot_use = m_new(uint32_t, slots);
@@ -630,6 +700,15 @@ static mp_obj_t gbe_display_hw(size_t n_args, const mp_obj_t *args) {
     if (baud > 0) {
         spi_set_baudrate(self->spi, (unsigned)baud);
     }
+    if (!gbe_irq_ready) {
+        irq_add_shared_handler(DMA_IRQ_1, gbe_dma_irq, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+        gbe_irq_ready = true;
+    }
+    gbe_active = self;
+    dma_channel_acknowledge_irq1((uint)gbe_dma);
+    dma_channel_set_irq1_enabled((uint)gbe_dma, true);
+    irq_set_enabled(DMA_IRQ_1, true);
+    self->q_head = self->q_tail = 0;
     self->hw = true;
     self->pending = 0;
     return mp_const_none;
@@ -691,7 +770,7 @@ static mp_obj_t gbe_frame(size_t n_args, const mp_obj_t *args) {
     self->pending = 0;
     gb_run_frame(&self->gb);
     gbe_flush(self);
-    gbe_dma_wait(self);  // leave the bus idle so Python can use the display between frames
+    // the queue keeps draining in the background; call sync() before touching the display from Python
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_frame_obj, 2, 3, gbe_frame);
