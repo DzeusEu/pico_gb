@@ -1,4 +1,4 @@
-# TinyOS - tiny console OS for Raspberry Pi Pico W + ST7789 LCD.
+# RTSP_OS - mala konsola do gier dla Raspberry Pi Pico W + ST7789 LCD.
 # System object `tos` is handed to games/apps: run(tos) / emulator run(tos, path).
 import gc
 import io
@@ -13,7 +13,8 @@ import buttons
 from buttons import Buttons, UP, DOWN, LEFT, RIGHT, A, B, START
 from st7789 import ST7789, rgb
 
-VERSION = "0.2"
+OS_NAME = "RTSP_OS"
+VERSION = "0.3"
 SD_DIR = "/sd"
 HEADER_H = 20
 FOOTER_H = 16
@@ -21,7 +22,7 @@ ROW_H = 16
 ROWS = 12
 
 # files that must never be launched from the browser or deleted by it
-PROTECTED = ("main", "boot", "config", "tinyos", "st7789", "buttons", "filebrowser", "sdcard")
+PROTECTED = ("main", "boot", "config", "tinyos", "st7789", "buttons", "filebrowser", "sdcard", "xmb")
 TEXT_EXT = ("txt", "md", "json", "cfg", "ini", "csv", "log", "py")
 
 
@@ -67,7 +68,7 @@ class System:
 
         # settings (saved in /data/settings.json, defaults from config.py)
         self.s = {"sound": 1, "invert": 1 if config.LCD_INVERT else 0,
-                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION}
+                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION, "splash": 1}
         saved = self.load("settings", None)
         if isinstance(saved, dict):
             for k in self.s:
@@ -96,7 +97,7 @@ class System:
         """(Re)mount the SD card at /sd. Returns True on success; reason in self.sd_error."""
         cs = getattr(config, "SD_CS", None)
         if cs is None:
-            self.sd_error = "disabled (no SD_CS in config.py)"
+            self.sd_error = "wyłączona (brak SD_CS w config.py)"
             return False
         self.sd_unmount()
         try:
@@ -126,38 +127,38 @@ class System:
     def sd_menu(self):
         sel = 0
         while True:
-            state = "mounted" if self.sd else "none"
-            items = [("Mount / remount", self.GREEN),
-                     ("Unmount (safe to remove)", self.ORANGE),
-                     ("Card info", self.WHITE)]
-            idx, key = self.menu("SD card: " + state, items, "A:Select  B:Back", sel)
+            state = "zamontowana" if self.sd else "brak"
+            items = [("Zamontuj / ponownie", self.GREEN),
+                     ("Odmontuj (bezpiecznie wyjąć)", self.ORANGE),
+                     ("Informacje o karcie", self.WHITE)]
+            idx, key = self.menu("Karta SD: " + state, items, "A:Wybierz  B:Wstecz", sel)
             if key == "B":
                 return
             sel = idx
             if idx == 0:
                 if self.sd_mount():
-                    self.message("SD card", "Mounted at /sd", self.GREEN)
+                    self.message("Karta SD", "Zamontowana w /sd", self.GREEN)
                 else:
-                    self.message("SD card", "Failed: " + self.sd_error, self.RED)
+                    self.message("Karta SD", "Błąd: " + self.sd_error, self.RED)
             elif idx == 1:
                 if self.sd:
                     self.sd_unmount()
-                    self.message("SD card", "Unmounted. You can remove the card.", self.GREEN)
+                    self.message("Karta SD", "Odmontowano. Możesz wyjąć kartę.", self.GREEN)
                 else:
-                    self.message("SD card", "Nothing mounted.")
+                    self.message("Karta SD", "Nic nie jest zamontowane.")
             else:
-                self.message("SD card", self.sd_summary())
+                self.message("Karta SD", self.sd_summary())
 
     def sd_summary(self):
         if not self.sd:
-            return "No card mounted.\n" + (self.sd_error or "")
+            return "Brak karty.\n" + (self.sd_error or "")
         try:
             st = uos.statvfs(SD_DIR)
             total = st[0] * st[2] // 1048576
             free = st[0] * st[3] // 1048576
-            return "Mounted at /sd\nSize: %d MB\nFree: %d MB" % (total, free)
+            return "Zamontowana w /sd\nRozmiar: %d MB\nWolne: %d MB" % (total, free)
         except Exception as e:
-            return "Card error: %s" % e
+            return "Błąd karty: %s" % e
 
     def find_emu(self, ext):
         """Path of the emulator handling .ext files, or None."""
@@ -254,7 +255,7 @@ class System:
         self.footer(hint)
         if n == 0:
             self.header(title)
-            self.ctext("(empty)", 100, self.GRAY)
+            self.ctext("(pusto)", 100, self.GRAY)
             while True:
                 k = self.btn.wait()
                 if k & B:
@@ -312,12 +313,12 @@ class System:
         cols = (self.W - 16) // 8
         lines = wrap(text, cols)
         self.clear()
-        self.header("Confirm")
+        self.header("Potwierdź")
         y = 40
         for ln in lines[:10]:
             self.lcd.text(ln, 8, y, self.WHITE, self.BG)
             y += 12
-        self.footer("A:Yes  B:No")
+        self.footer("A:Tak  B:Nie")
         while True:
             k = self.btn.wait()
             if k & A:
@@ -332,7 +333,7 @@ class System:
         last = max(0, len(lines) - per)
         pos = 0
         self.clear()
-        self.footer("UP/DOWN:Scroll L/R:Page B:Back")
+        self.footer("G/D:Przewiń L/P:Strona B:Wstecz")
         while True:
             self.header(title, "%d/%d" % (min(pos + per, len(lines)), len(lines)))
             self.lcd.fill_rect(0, HEADER_H + 2, self.W, per * 10 + 4, self.BG)
@@ -365,7 +366,7 @@ class System:
         name = fname.rpartition(".")[0]
         d = d or "/"
         if name in PROTECTED or name in sys.modules:
-            self.message("Cannot run", "'%s' is a system file or clashes with a loaded module." % fname, self.ORANGE)
+            self.message("Nie można uruchomić", "'%s' to plik systemowy lub koliduje z załadowanym modułem." % fname, self.ORANGE)
             return
         added = False
         if d not in sys.path:
@@ -379,7 +380,7 @@ class System:
             buf = io.StringIO()
             sys.print_exception(e, buf)
             self.btn.release()
-            self.viewer("Error: " + fname, buf.getvalue())
+            self.viewer("Błąd: " + fname, buf.getvalue())
         finally:
             sys.modules.pop(name, None)
             if added and d in sys.path:
@@ -404,33 +405,83 @@ class System:
         return False
 
     # ------------------------------------------------------------ screens
+    def show_raw(self, path):
+        """Show a raw 320x240 RGB565 (high byte first) image, streamed 8 rows at a time."""
+        W, H = self.W, self.H
+        need = W * H * 2
+        if uos.stat(path)[6] != need:
+            return False
+        rows = 8
+        buf = bytearray(W * rows * 2)
+        with open(path, "rb") as f:
+            for y in range(0, H, rows):
+                f.readinto(buf)
+                self.lcd.blit(buf, 0, y, W, rows)
+        return True
+
     def splash(self):
-        self.clear()
-        self.ctext("TINY OS", 70, self.CYAN, scale=4)
-        self.ctext("Pico W game console", 125, self.GRAY)
-        self.ctext("v" + VERSION, 145, self.GRAY)
+        if not self.s.get("splash", 1):
+            return
+        shown = False
+        for p in ("/splash.raw", SD_DIR + "/splash.raw"):
+            try:
+                if self.show_raw(p):
+                    shown = True
+                    break
+            except Exception:
+                pass
+        if shown:
+            time.sleep_ms(1800)
+            return
+        self.clear(rgb(8, 16, 60))
+        self.ctext("RTSP_OS", 70, self.WHITE, rgb(8, 16, 60), 5)
+        self.ctext("Konsola do gier Pico W", 125, rgb(176, 196, 238), rgb(8, 16, 60))
+        self.ctext("v" + VERSION, 145, rgb(176, 196, 238), rgb(8, 16, 60))
         if self.sd:
-            self.ctext("SD card: OK", 175, self.GREEN)
+            self.ctext("Karta SD: OK", 175, self.GREEN, rgb(8, 16, 60))
         elif getattr(config, "SD_CS", None) is not None:
-            self.ctext("SD card: not found", 175, self.ORANGE)
+            self.ctext("Karta SD: nie znaleziono", 175, self.ORANGE, rgb(8, 16, 60))
         time.sleep_ms(900 if self.sd or getattr(config, "SD_CS", None) is None else 1500)
+
+    def list_games(self):
+        """[(title, path, where)] for /games and /sd/games."""
+        titles = {"snake": "Wąż", "breakout": "Cegiełki", "pong": "Pong"}
+        games = []
+        for d, where in (("/games", ""), (SD_DIR + "/games", "SD")):
+            try:
+                for f in sorted(uos.listdir(d)):
+                    if f.endswith(".py") and not f.startswith("_"):
+                        base = f.rpartition(".")[0]
+                        games.append((titles.get(base) or pretty(f), d + "/" + f, where))
+            except OSError:
+                pass
+        return games
+
+    def list_roms(self):
+        """[(title, path, where)] for Game Boy ROMs found on the SD card."""
+        out = []
+        seen = set()
+        for d in (SD_DIR + "/roms", SD_DIR, "/roms"):
+            try:
+                for f in sorted(uos.listdir(d)):
+                    e = ext_of(f)
+                    p = d + "/" + f
+                    if e in ("gb", "gbc") and p not in seen:
+                        seen.add(p)
+                        out.append((f.rpartition(".")[0], p, "SD" if d.startswith(SD_DIR) else ""))
+            except OSError:
+                pass
+        return out
 
     def games(self):
         sel = 0
         while True:
-            games = []  # (title, path, where)
-            for d, where in (("/games", ""), (SD_DIR + "/games", "SD")):
-                try:
-                    for f in sorted(uos.listdir(d)):
-                        if f.endswith(".py") and not f.startswith("_"):
-                            games.append((pretty(f), d + "/" + f, where))
-                except OSError:
-                    pass
+            games = self.list_games()
             if not games:
-                self.message("Games", "No games found. Copy .py files into /games or /sd/games (see README).", self.ORANGE)
+                self.message("Gry", "Nie znaleziono gier. Skopiuj pliki .py do /games lub /sd/games.", self.ORANGE)
                 return
             items = [(g[0], self.GREEN, g[2]) for g in games]
-            idx, key = self.menu("Games", items, "A:Play  B:Back", sel)
+            idx, key = self.menu("Gry", items, "A:Graj  B:Wstecz", sel)
             if key == "B":
                 return
             sel = idx
@@ -439,6 +490,29 @@ class System:
 
     def save_settings(self):
         self.save("settings", self.s)
+
+    def toggle_setting(self, name):
+        s = self.s
+        if name == "sound":
+            s["sound"] ^= 1
+            self.beep()
+        elif name == "invert":
+            s["invert"] ^= 1
+            self.lcd.set_invert(bool(s["invert"]))
+        elif name == "bgr":
+            s["bgr"] ^= 1
+            self.lcd.set_rotation(s["rot"], bool(s["bgr"]))
+        elif name == "rot":
+            s["rot"] = 1 if s["rot"] == 3 else 3
+            self.lcd.set_rotation(s["rot"], bool(s["bgr"]))
+        elif name == "splash":
+            s["splash"] = 0 if s.get("splash", 1) else 1
+        self.save_settings()
+
+    def reboot(self):
+        if self.confirm("Uruchomić konsolę ponownie?"):
+            self.sd_unmount()
+            reset()
 
     def color_test(self):
         lcd = self.lcd
@@ -451,41 +525,10 @@ class System:
             v = x * 255 // (self.W - 1)
             lcd.fill_rect(x, self.H - 60, 1, 20, rgb(v, v, v))
         lcd.fill_rect(0, self.H - 40, self.W, 40, self.BG)
-        lcd.text("Bars: red green blue white black", 4, self.H - 34, self.WHITE, self.BG)
-        lcd.text("Wrong colors? Toggle Invert/Order", 4, self.H - 20, self.GRAY, self.BG)
+        lcd.text("Pasy: czerw. ziel. niebi. biały czarny", 4, self.H - 34, self.WHITE, self.BG)
+        lcd.text("Złe kolory? Zmień Odwróć/Kolejność", 4, self.H - 20, self.GRAY, self.BG)
         while not (self.btn.wait() & (A | B)):
             pass
-
-    def settings(self):
-        sel = 0
-        while True:
-            s = self.s
-            items = [
-                ("Sound", None, "ON" if s["sound"] else "OFF"),
-                ("Invert colors", None, "ON" if s["invert"] else "OFF"),
-                ("Color order", None, "BGR" if s["bgr"] else "RGB"),
-                ("Flip screen 180", None, "YES" if s["rot"] == 3 else "NO"),
-                ("Color test", None, ""),
-            ]
-            idx, key = self.menu("Settings", items, "A:Change  B:Back", sel)
-            if key == "B":
-                return
-            sel = idx
-            if idx == 0:
-                s["sound"] ^= 1
-                self.beep()
-            elif idx == 1:
-                s["invert"] ^= 1
-                self.lcd.set_invert(bool(s["invert"]))
-            elif idx == 2:
-                s["bgr"] ^= 1
-                self.lcd.set_rotation(s["rot"], bool(s["bgr"]))
-            elif idx == 3:
-                s["rot"] = 1 if s["rot"] == 3 else 3
-                self.lcd.set_rotation(s["rot"], bool(s["bgr"]))
-            elif idx == 4:
-                self.color_test()
-            self.save_settings()
 
     def info(self):
         gc.collect()
@@ -495,50 +538,32 @@ class System:
             st = uos.statvfs("/")
             fs_free = st[0] * st[3] // 1024
             fs_total = st[0] * st[2] // 1024
-            fs = "%d / %d KB free" % (fs_free, fs_total)
+            fs = "wolne %d / %d KB" % (fs_free, fs_total)
         except Exception:
-            fs = "n/a"
-        sd = self.sd_summary().replace("\n", ", ") if self.sd else "none"
-        text = "TinyOS v%s\n%s\nCPU: %d MHz\nRAM: %d / %d KB free\nFlash: %s\nSD: %s\nScreen: %dx%d ST7789\n" % (
-            VERSION, sys.version.split(";")[0] if ";" in sys.version else sys.version,
+            fs = "b/d"
+        sd = self.sd_summary().replace("\n", ", ") if self.sd else "brak"
+        text = "%s v%s\n%s\nCPU: %d MHz\nRAM: wolne %d / %d KB\nFlash: %s\nSD: %s\nEkran: %dx%d ST7789\n" % (
+            OS_NAME, VERSION, sys.version.split(";")[0] if ";" in sys.version else sys.version,
             freq() // 1000000, free // 1024, total // 1024, fs, sd, self.W, self.H)
-        self.viewer("System info", text)
+        self.viewer("Informacje o systemie", text)
 
     def home(self):
-        sel = 0
-        while True:
-            items = [("Games", self.GREEN), ("File browser", self.YELLOW),
-                     ("SD card", self.PURPLE, "OK" if self.sd else "none"),
-                     ("Settings", self.CYAN), ("System info", self.WHITE),
-                     ("Reboot", self.ORANGE)]
-            idx, key = self.menu("TinyOS", items, "UP/DOWN:Select  A:OK", sel)
-            if key != "A":
-                continue
-            sel = idx
-            self.btn.release()
-            if idx == 0:
-                self.games()
-            elif idx == 1:
-                self.browser()
-            elif idx == 2:
-                self.sd_menu()
-            elif idx == 3:
-                self.settings()
-            elif idx == 4:
-                self.info()
-            elif idx == 5:
-                if self.confirm("Reboot the console?"):
-                    self.sd_unmount()
-                    reset()
+        """Home screen: XMB-style menu (xmb.py)."""
+        import xmb
+        try:
+            xmb.run(self)
+        finally:
+            sys.modules.pop("xmb", None)
+            gc.collect()
 
-    def browser(self):
+    def browser(self, path="/"):
         import filebrowser
         try:
-            filebrowser.run(self)
+            filebrowser.run(self, path)
         except Exception as e:
             buf = io.StringIO()
             sys.print_exception(e, buf)
-            self.viewer("File browser error", buf.getvalue())
+            self.viewer("Błąd przeglądarki plików", buf.getvalue())
         finally:
             sys.modules.pop("filebrowser", None)
             gc.collect()

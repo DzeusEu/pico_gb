@@ -17,10 +17,33 @@ FRAME_US = 16743            # 59.73 Hz
 OC_HZ = 250_000_000
 FAST_SPI = 62_500_000       # "fast" display clock (needs OC on to be exact; some panels glitch)
 
+def _pal(name, bg, obj0=None, obj1=None):
+    """(name, background shades, sprite palette 0 shades, sprite palette 1 shades);
+    shades are (r, g, b) tuples, lightest first. Sprites default to the background colours."""
+    conv = lambda t: tuple(rgb(*c) for c in t)
+    bg = conv(bg)
+    o0 = conv(obj0) if obj0 else bg
+    o1 = conv(obj1) if obj1 else o0
+    return (name, bg + o0 + o1)
+
+
+# Several palettes colour the background and the two sprite palettes differently, like the
+# Game Boy Color did for old black-and-white games.
 PALETTES = (
-    ("Green", (rgb(224, 248, 208), rgb(136, 192, 112), rgb(52, 104, 86), rgb(8, 24, 32))),
-    ("Gray", (rgb(255, 255, 255), rgb(170, 170, 170), rgb(85, 85, 85), rgb(0, 0, 0))),
-    ("Amber", (rgb(255, 230, 160), rgb(220, 160, 60), rgb(130, 70, 20), rgb(30, 15, 5))),
+    _pal("Zielona", ((224, 248, 208), (136, 192, 112), (52, 104, 86), (8, 24, 32))),
+    _pal("Szara", ((255, 255, 255), (170, 170, 170), (85, 85, 85), (0, 0, 0))),
+    _pal("Bursztyn", ((255, 230, 160), (220, 160, 60), (130, 70, 20), (30, 15, 5))),
+    _pal("Kolor A",
+         ((255, 255, 255), (123, 255, 49), (0, 99, 198), (0, 0, 0)),
+         ((255, 255, 255), (255, 133, 132), (148, 58, 58), (0, 0, 0))),
+    _pal("Kolor B",
+         ((255, 255, 255), (255, 173, 99), (132, 49, 0), (0, 0, 0)),
+         ((255, 255, 255), (255, 173, 99), (132, 49, 0), (0, 0, 0)),
+         ((255, 255, 255), (99, 165, 255), (0, 0, 255), (0, 0, 0))),
+    _pal("Kolor C",
+         ((255, 255, 255), (165, 165, 255), (82, 82, 140), (0, 0, 0)),
+         ((255, 255, 255), (255, 148, 148), (148, 58, 58), (0, 0, 0)),
+         ((255, 255, 255), (148, 255, 148), (49, 132, 49), (0, 0, 0))),
 )
 
 # RAM the emulator needs besides the ROM bank cache: Peanut-GB state (~17 KB) + display
@@ -88,10 +111,10 @@ def _pick(tos):
         except OSError:
             pass
     if not roms:
-        tos.message("Game Boy", "No ROMs found. Put .gb files in /sd/roms (or /sd), or open one from the file browser.", tos.ORANGE)
+        tos.message("Game Boy", "Nie znaleziono ROM-ów. Skopiuj pliki .gb do /sd/roms (lub /sd) albo otwórz plik z przeglądarki.", tos.ORANGE)
         return None
     items = [(n[:30], tos.GREEN, "SD" if p.startswith("/sd") else "") for n, p in roms]
-    idx, key = tos.menu("Game Boy ROMs", items, "A:Play  B:Back")
+    idx, key = tos.menu("ROM-y Game Boy", items, "A:Graj  B:Wstecz")
     return roms[idx][1] if key == "A" and idx >= 0 else None
 
 
@@ -103,7 +126,7 @@ def run(tos, path=None):
     try:
         import gbemu
     except ImportError:
-        tos.message("Game Boy", "This firmware has no 'gbemu' module. Build it as described in BUILD.md and flash the new UF2.", tos.RED)
+        tos.message("Game Boy", "Ten firmware nie ma modułu 'gbemu'. Zbuduj go według BUILD.md i wgraj nowy UF2.", tos.RED)
         return
 
     saved = tos.load("gb", {})
@@ -116,7 +139,7 @@ def run(tos, path=None):
     }
 
     tos.clear(tos.BLACK)
-    tos.ctext("Loading...", 110, tos.WHITE, tos.BLACK)
+    tos.ctext("Wczytywanie...", 110, tos.WHITE, tos.BLACK)
     gc.collect()
     f = open(path, "rb")
     emu = None
@@ -127,6 +150,16 @@ def run(tos, path=None):
     clocked = False
     slots = 0
     try:
+        # Game Boy Color-only games (header byte 0x143 = 0xC0) cannot run on this DMG emulator
+        try:
+            f.seek(0x143)
+            cgb = f.read(1)
+            f.seek(0)
+        except Exception:
+            cgb = b""
+        if cgb and cgb[0] == 0xC0:
+            tos.message("Game Boy Color", "Ta gra działa tylko na Game Boy Color, a ten emulator obsługuje oryginalnego Game Boya. Gry oznaczone jako działające na obu (większość wczesnych kolorowych) uruchomią się w trybie klasycznym z kolorowym odcieniem.", tos.ORANGE)
+            return
         try:
             banks, ram = _plan(f)
             free = gc.mem_free()
@@ -149,7 +182,7 @@ def run(tos, path=None):
             return
         if emu is None:
             need = (CORE_BYTES + ram + BANK + RESERVE) // 1024
-            tos.message("Game Boy", "Not enough free RAM: %d KB free, needs about %d KB. See BUILD.md (freeze the OS / use the RPI_PICO build)." % (gc.mem_free() // 1024, need), tos.RED)
+            tos.message("Game Boy", "Za mało wolnej pamięci RAM: wolne %d KB, potrzeba ok. %d KB. Zobacz BUILD.md (zamroź system / zbuduj dla RPI_PICO)." % (gc.mem_free() // 1024, need), tos.RED)
             return
 
         sav = path.rpartition(".")[0] + ".sav"
@@ -190,19 +223,19 @@ def run(tos, path=None):
             sel = 0
             while True:
                 rows = (
-                    ("resume", "Resume", tos.GREEN, ""),
-                    ("select", "Press SELECT", None, ""),
-                    ("save", "Save game", None, "" if has_ram else "no RAM"),
-                    ("scale", "Scale", None, "1.5x" if st["scale"] else "1x"),
-                    ("fskip", "Frame skip", None, "ON" if st["fskip"] else "OFF"),
-                    ("fast", "Display clock", None, "FAST" if st["fast"] else "NORMAL"),
-                    ("pal", "Palette", None, PALETTES[st["pal"]][0]),
-                    ("oc", "Overclock 250 MHz", None, "ON" if st["oc"] else "OFF"),
-                    ("diag", "Diagnostics", None, ""),
-                    ("quit", "Quit game", tos.ORANGE, ""),
+                    ("resume", "Wznów", tos.GREEN, ""),
+                    ("select", "Wciśnij SELECT", None, ""),
+                    ("save", "Zapisz grę", None, "" if has_ram else "brak RAM"),
+                    ("scale", "Skala", None, "1.5x" if st["scale"] else "1x"),
+                    ("fskip", "Pomijanie klatek", None, "WŁ." if st["fskip"] else "WYŁ."),
+                    ("fast", "Zegar ekranu", None, "SZYBKI" if st["fast"] else "NORMALNY"),
+                    ("pal", "Paleta", None, PALETTES[st["pal"]][0]),
+                    ("oc", "Podkręcenie 250 MHz", None, "WŁ." if st["oc"] else "WYŁ."),
+                    ("diag", "Diagnostyka", None, ""),
+                    ("quit", "Zakończ grę", tos.ORANGE, ""),
                 )
                 items = [(r[1], r[2], r[3]) for r in rows]
-                idx, key = tos.menu("%s %dfps" % (title[:15], diag[0]), items, "A:Select  B:Resume", sel)
+                idx, key = tos.menu("%s %dfps" % (title[:15], diag[0]), items, "A:Wybierz  B:Wznów", sel)
                 if key == "B":
                     return "resume"
                 sel = idx
@@ -214,7 +247,7 @@ def run(tos, path=None):
                 if what == "save":
                     if has_ram:
                         ok = _write_save(emu, sav)
-                        tos.message("Game Boy", "Saved." if ok else "Could not write the save file.",
+                        tos.message("Game Boy", "Zapisano." if ok else "Nie można zapisać pliku.",
                                     tos.GREEN if ok else tos.RED)
                 elif what == "scale":
                     st["scale"] ^= 1
@@ -228,12 +261,12 @@ def run(tos, path=None):
                     st["oc"] ^= 1
                     set_clock(bool(st["oc"]))
                 elif what == "diag":
-                    tos.message("Diagnostics",
-                                "Speed: %d fps (60 = full)\nROM bank loads: %d/s\nTime loading: %d ms/s\nWaiting for screen: %d ms/s\nCache slots: %d of %d banks\nFree RAM: %d KB\nClock: %d MHz" % (
+                    tos.message("Diagnostyka",
+                                "Prędkość: %d fps (60 = pełna)\nŁadowanie banków: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nSloty cache: %d z %d banków\nWolny RAM: %d KB\nZegar: %d MHz" % (
                                     diag[0], diag[1], diag[2], diag[3], slots, banks - 1,
                                     gc.mem_free() // 1024, freq() // 1000000))
                 elif what == "quit":
-                    if tos.confirm("Quit the game?"):
+                    if tos.confirm("Zakończyć grę?"):
                         return "quit"
 
         set_clock(bool(st["oc"]))

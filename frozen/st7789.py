@@ -12,6 +12,98 @@ def rgb(r, g, b):
     return ((c & 0xFF) << 8) | (c >> 8)
 
 
+# ---- Polish letters ---------------------------------------------------------------------
+# The built-in 8x8 font only has ASCII. Accented letters are composed from the plain base
+# letter plus a few extra pixels. The base letter is looked up from the font itself, so this
+# works whatever the glyph shapes are. If a capital has no free row above it, the letter is
+# moved down one pixel to make room for the mark.
+# kinds: "a" acute (ć ń ó ś ź), "d" dot (ż), "o" ogonek (ą ę), "s" stroke (ł)
+_PL = {
+    "ą": ("a", "o"), "ć": ("c", "a"), "ę": ("e", "o"), "ł": ("l", "s"), "ń": ("n", "a"),
+    "ó": ("o", "a"), "ś": ("s", "a"), "ź": ("z", "a"), "ż": ("z", "d"),
+    "Ą": ("A", "o"), "Ć": ("C", "a"), "Ę": ("E", "o"), "Ł": ("L", "s"), "Ń": ("N", "a"),
+    "Ó": ("O", "a"), "Ś": ("S", "a"), "Ź": ("Z", "a"), "Ż": ("Z", "d"),
+}
+_bb = {}
+
+
+def _bbox(ch):
+    """(left, right, top, bottom) pixel columns/rows used by a plain glyph in its 8x8 cell."""
+    r = _bb.get(ch)
+    if r is None:
+        buf = bytearray(8)
+        fb = framebuf.FrameBuffer(buf, 8, 8, framebuf.MONO_HLSB)
+        fb.text(ch, 0, 0, 1)
+        left, right, top, bot = 8, -1, 8, -1
+        for y in range(8):
+            row = buf[y]
+            if row:
+                if y < top:
+                    top = y
+                bot = y
+                for x in range(8):
+                    if row & (0x80 >> x):
+                        if x < left:
+                            left = x
+                        if x > right:
+                            right = x
+        if right < 0:
+            left, right, top, bot = 1, 5, 1, 6
+        r = (left, right, top, bot)
+        _bb[ch] = r
+    return r
+
+
+def _accented(fb, cx, y, ch, color):
+    base, kind = _PL[ch]
+    left, right, top, bot = _bbox(base)
+    sh = 0
+    if kind == "a" and top < 2:
+        sh = 2 - top
+    elif kind == "d" and top < 1:
+        sh = 1
+    if bot + sh > 7:
+        sh = 7 - bot
+    fb.text(base, cx, y + sh, color)
+    t = y + sh + top
+    mid = cx + (left + right) // 2
+    if kind == "a":
+        fb.pixel(mid + 1, t - 2, color)
+        fb.pixel(mid, t - 1, color)
+    elif kind == "d":
+        fb.pixel(mid, t - 1, color)
+    elif kind == "o":
+        yy = y + sh + bot + 1
+        if yy <= y + 7:
+            fb.pixel(cx + right, yy, color)
+            fb.pixel(cx + right - 1, yy, color)
+    else:  # stroke through the stem
+        sx = cx + (left if base == "L" else (left + right) // 2)
+        yc = y + top + (bot - top) // 2
+        fb.line(sx - 2, yc + 2, sx + 2, yc - 1, color)
+
+
+def pl_text(fb, s, x, y, color):
+    """Draw text with Polish letters into any framebuf.FrameBuffer (transparent background).
+    Characters the font does not have are shown as '?'."""
+    if len(s.encode()) == len(s):  # plain ASCII: fast path
+        fb.text(s, x, y, color)
+        return
+    base = []
+    marks = []
+    for i, ch in enumerate(s):
+        if ord(ch) < 128:
+            base.append(ch)
+        elif ch in _PL:
+            base.append(" ")
+            marks.append((i, ch))
+        else:
+            base.append("?")
+    fb.text("".join(base), x, y, color)
+    for i, ch in marks:
+        _accented(fb, x + 8 * i, y, ch, color)
+
+
 class ST7789:
     def __init__(self, spi, dc, cs, rst, width=240, height=320,
                  rotation=1, invert=True, bgr=False):
@@ -150,7 +242,7 @@ class ST7789:
         buf = bytearray(w * 16)
         fb = framebuf.FrameBuffer(buf, w, 8, framebuf.RGB565)
         fb.fill(bg)
-        fb.text(s, 0, 0, fg)
+        pl_text(fb, s, 0, 0, fg)
         if scale == 1:
             self.blit(buf, x, y, w, 8)
             return

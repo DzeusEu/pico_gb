@@ -1,4 +1,4 @@
-# .gbc files use the same emulator (Game Boy Color games that also support the
+# Pliki .gbc use the same emulator (Game Boy Color games that also support the
 # original Game Boy run in monochrome; GBC-only games are not supported).
 import sys
 

@@ -1,4 +1,4 @@
-# File browser for TinyOS (internal flash filesystem).
+# Przeglądarka plików RTSP_OS.
 import uos
 from tinyos import PROTECTED, TEXT_EXT, ext_of
 
@@ -41,31 +41,31 @@ def _view(tos, path):
             chars.append(".")
     text = "".join(chars)
     if len(data) == 4096:
-        text += "\n\n[... truncated at 4 KB ...]"
+        text += "\n\n[... ucięto po 4 KB ...]"
     tos.viewer(path.rpartition("/")[2], text)
 
 
 def _info(tos, path, is_dir):
     st = uos.stat(path)
-    kind = "Folder" if is_dir else "File"
-    text = "%s: %s\nPath: %s\nSize: %d bytes" % (kind, path.rpartition("/")[2], path, st[6])
+    kind = "Folder" if is_dir else "Plik"
+    text = "%s: %s\nŚcieżka: %s\nRozmiar: %d B" % (kind, path.rpartition("/")[2], path, st[6])
     if not is_dir:
         e = ext_of(path)
         if e == "py":
-            text += "\nType: program (A runs it)"
+            text += "\nTyp: program (A uruchamia)"
         else:
             if tos.find_emu(e):
-                text += "\nHandler: emulator '%s'" % e
+                text += "\nObsługa: emulator '%s'" % e
             else:
-                text += "\nHandler: none installed"
-    tos.message("Info", text)
+                text += "\nObsługa: brak"
+    tos.message("Informacje", text)
 
 
 def _delete(tos, path, name, is_dir):
     if path.count("/") == 1 and name.rpartition(".")[0] in PROTECTED:
-        tos.message("Protected", "System files cannot be deleted here.", tos.ORANGE)
+        tos.message("Chronione", "Plików systemowych nie można tu usunąć.", tos.ORANGE)
         return
-    if not tos.confirm("Delete %s '%s'?" % ("folder" if is_dir else "file", name)):
+    if not tos.confirm("Usunąć %s '%s'?" % ("folder" if is_dir else "plik", name)):
         return
     try:
         if is_dir:
@@ -73,7 +73,7 @@ def _delete(tos, path, name, is_dir):
         else:
             uos.remove(path)
     except OSError:
-        tos.message("Error", "Could not delete (folders must be empty).", tos.RED)
+        tos.message("Błąd", "Nie udało się usunąć (folder musi być pusty).", tos.RED)
 
 
 def _open(tos, path, name):
@@ -87,14 +87,15 @@ def _open(tos, path, name):
         _info(tos, path, False)
 
 
-def run(tos):
-    path = "/"
+def run(tos, start="/"):
+    root = start
+    path = start
     memo = {}
     while True:
         try:
             entries = _list(path)
         except OSError:
-            path = "/"
+            path = root
             continue
         items = []
         for name, is_dir, size in entries:
@@ -104,10 +105,10 @@ def run(tos):
                 e = ext_of(name)
                 color = tos.GREEN if e == "py" else tos.WHITE
                 items.append((name, color, _size(size)))
-        hint = "A:Open B:Up START:Menu"
+        hint = "A:Otwórz B:Wyżej START:Menu"
         idx, key = tos.menu(path, items, hint, memo.get(path, 0), allow_start=True)
         if key == "B":
-            if path == "/":
+            if path == root:
                 return
             memo.pop(path, None)
             path = _parent(path)
@@ -123,18 +124,18 @@ def run(tos):
             else:
                 _open(tos, full, name)
         else:  # START: context menu
-            actions = ["Info", "Delete", "Cancel"]
+            actions = ["Informacje", "Usuń", "Anuluj"]
             if not is_dir:
-                actions = ["Open / Run", "View as text"] + actions
-            a, k = tos.menu(name, actions, "A:Select  B:Cancel")
+                actions = ["Otwórz / Uruchom", "Podgląd tekstu"] + actions
+            a, k = tos.menu(name, actions, "A:Wybierz  B:Anuluj")
             if k != "A":
                 continue
             act = actions[a]
-            if act == "Open / Run":
+            if act == "Otwórz / Uruchom":
                 _open(tos, full, name)
-            elif act == "View as text":
+            elif act == "Podgląd tekstu":
                 _view(tos, full)
-            elif act == "Info":
+            elif act == "Informacje":
                 _info(tos, full, is_dir)
-            elif act == "Delete":
+            elif act == "Usuń":
                 _delete(tos, full, name, is_dir)

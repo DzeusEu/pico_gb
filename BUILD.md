@@ -1,4 +1,4 @@
-# Game Boy emulator for TinyOS: build and install
+# RTSP_OS (Polish UI, XMB menu) + Game Boy emulator: build and install
 
 The emulator core (Peanut-GB, MIT license) is C code, so it is compiled **into the MicroPython firmware**. The build downloads the Peanut-GB header for you.
 
@@ -19,13 +19,31 @@ Hold BOOTSEL, plug in the Pico, copy `firmware.uf2` to the `RPI-RP2` drive. Your
 
 ## 3. If you built with freeze_os (the default)
 
-After flashing, delete these five files from the Pico's root in Thonny, because a copy on the Pico would be used instead of the frozen one and would use RAM again:
+After flashing, delete these six files from the Pico's root in Thonny, because a copy on the Pico would be used instead of the frozen one and would use RAM again:
 
-`tinyos.py`, `st7789.py`, `buttons.py`, `filebrowser.py`, `sdcard.py`
+`tinyos.py`, `st7789.py`, `buttons.py`, `filebrowser.py`, `sdcard.py`, `xmb.py`
 
-**Keep** `main.py` and `config.py` (and `games/`, `emulators/`, `data/`). If the console fails to start after deleting, re-upload the five files and tell me, or rebuild with freeze_os off.
+**Keep** `main.py` and `config.py` (and `games/`, `emulators/`, `data/`). If the console fails to start after deleting, re-upload the six files and tell me, or rebuild with freeze_os off.
 
-Changes to those five files now need a new firmware build (edit the copies in `frozen/`). Settings in `config.py`, games and emulators stay normal files.
+Changes to those files now need a new firmware build (edit the copies in `frozen/`). Settings in `config.py`, games and emulators stay normal files.
+
+## RTSP_OS: two ways to install the new version
+
+**A. Without rebuilding (quickest).** Upload the files from `pico_files.zip` to the Pico in Thonny (overwrite): `main.py`, `tinyos.py`, `st7789.py`, `filebrowser.py`, `xmb.py` to the root; `games/*.py`; `emulators/gb.py`, `emulators/gbc.py`. Do **not** overwrite `config.py` or `/data`. Files on the Pico override the frozen ones, so this works with any firmware, but if you have a frozen OS they use RAM again until you do path B.
+
+**B. Rebuild the firmware.** Replace `frozen/` and `manifest.py` in your GitHub repo (the manifest now also freezes `xmb.py`), run the workflow, flash, then delete the six OS files from the Pico root (see section 3) and upload only `main.py`, `games/`, `emulators/`.
+
+## Splash screen with your own image
+
+Convert any picture on your PC (needs Python + Pillow):
+
+    python tools/make_splash.py my_image.png
+
+This writes `splash.raw` (320x240). Copy it to the Pico root (or the SD card root). Without the file a built-in RTSP_OS splash is shown. The splash can be switched off in *Ustawienia > Ekran startowy*.
+
+## XMB menu
+
+L/R: change category (Gry, Game Boy, Pliki, Ustawienia, System). Up/Down: choose an item. A: open. Game Boy lists the `.gb`/`.gbc` files from `/sd/roms`, `/sd` and `/roms`. Polish letters are drawn by `st7789.py` from the plain font, so no font file is needed.
 
 ## 4. Install the front-end
 
@@ -57,8 +75,17 @@ Send me this screen if a game is still slow:
 - **Waiting for screen**: big numbers mean the display link is the limit (use frame skip, fast display clock, or 1x).
 - **Cache slots / free RAM**.
 
+## Game Boy Color games
+
+The emulator core only knows the **original Game Boy**. I found no Game Boy Color core for the RP2040, and even the original Game Boy needs about 266 MHz in C to hold 60 fps there.
+
+- **Color-only games** (most late releases) now show a message instead of freezing.
+- **Games that work on both** (most early colour releases) run in classic mode.
+- **Colour:** the palettes *Color A/B/C* colour the background and the two sprite palettes separately, the way a Game Boy Color tints old games. This is a tint, not the game's own colour graphics.
+- ROMs of colour cartridges are larger, so they load more banks from the SD card. If one is slow, check Diagnostics (*ROM bank loads/s*), try `GB_SD_BAUD = 20_000_000` in `config.py`, and give the cache more RAM (RPI_PICO build, frozen OS).
+
 ## Limits
 
 - No sound.
-- Original Game Boy games only; Game Boy Color games that have a monochrome mode run in monochrome, GBC-only games do not work.
+- Original Game Boy hardware only (see above).
 - Cartridge RAM above 32 KB is not saved.
