@@ -1,0 +1,45 @@
+name: Build TinyOS firmware (MicroPython + Game Boy core)
+
+on:
+  workflow_dispatch:
+    inputs:
+      micropython_ref:
+        description: MicroPython tag or branch to build
+        default: v1.24.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential python3 curl git
+
+      - name: Get MicroPython
+        run: git clone --depth 1 --branch "${{ inputs.micropython_ref || 'v1.24.1' }}" https://github.com/micropython/micropython.git
+
+      - name: Get the Peanut-GB header (MIT license)
+        run: |
+          mkdir -p usermod/gbemu
+          curl -fL -o usermod/gbemu/peanut_gb.h https://raw.githubusercontent.com/deltabeard/Peanut-GB/v1.2.0/peanut_gb.h \
+            || curl -fL -o usermod/gbemu/peanut_gb.h https://raw.githubusercontent.com/deltabeard/Peanut-GB/master/peanut_gb.h
+          wc -l usermod/gbemu/peanut_gb.h
+
+      - name: Build mpy-cross
+        run: make -C micropython/mpy-cross -j4
+
+      - name: Fetch MicroPython submodules for the Pico W
+        run: make -C micropython/ports/rp2 BOARD=RPI_PICO_W submodules
+
+      - name: Build firmware with the gbemu module
+        run: make -C micropython/ports/rp2 BOARD=RPI_PICO_W USER_C_MODULES=$GITHUB_WORKSPACE/usermod/micropython.cmake -j4
+
+      - name: Upload UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinyos-picow-firmware
+          path: micropython/ports/rp2/build-RPI_PICO_W/firmware.uf2
