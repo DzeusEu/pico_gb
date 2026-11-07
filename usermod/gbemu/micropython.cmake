@@ -10,7 +10,10 @@ target_include_directories(usermod_gbemu INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}
 )
 
-# Peanut-GB is not warning-clean under MicroPython's -Werror; speed matters more than size here
-target_compile_options(usermod_gbemu INTERFACE -O3 -w)
+# Optimise only this file (Peanut-GB is not warning-clean under MicroPython's flags)
+set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/gbemu.c PROPERTIES COMPILE_OPTIONS "-O3;-w")
+
+# SPI + DMA are used to stream frames to the display
+target_link_libraries(usermod_gbemu INTERFACE hardware_dma hardware_spi hardware_clocks hardware_timer)
 
 target_link_libraries(usermod INTERFACE usermod_gbemu)

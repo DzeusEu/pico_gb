@@ -3,6 +3,17 @@ name: Build TinyOS firmware (MicroPython + Game Boy core)
 on:
   workflow_dispatch:
     inputs:
+      board:
+        description: "Board. RPI_PICO leaves out Wi-Fi (unused by TinyOS) and should leave more free RAM; it also runs on a Pico W."
+        type: choice
+        default: RPI_PICO_W
+        options:
+          - RPI_PICO_W
+          - RPI_PICO
+      freeze_os:
+        description: "Freeze the TinyOS system files into the firmware (saves a lot of RAM)"
+        type: boolean
+        default: true
       micropython_ref:
         description: MicroPython tag or branch to build
         default: v1.24.1
@@ -32,14 +43,21 @@ jobs:
       - name: Build mpy-cross
         run: make -C micropython/mpy-cross -j4
 
-      - name: Fetch MicroPython submodules for the Pico W
-        run: make -C micropython/ports/rp2 BOARD=RPI_PICO_W submodules
+      - name: Fetch MicroPython submodules
+        run: make -C micropython/ports/rp2 BOARD=${{ inputs.board || 'RPI_PICO_W' }} submodules
 
       - name: Build firmware with the gbemu module
-        run: make -C micropython/ports/rp2 BOARD=RPI_PICO_W USER_C_MODULES=$GITHUB_WORKSPACE/usermod/micropython.cmake -j4
+        run: |
+          BOARD="${{ inputs.board || 'RPI_PICO_W' }}"
+          EXTRA=""
+          if [ "${{ inputs.freeze_os }}" != "false" ]; then
+            EXTRA="FROZEN_MANIFEST=$GITHUB_WORKSPACE/manifest.py"
+          fi
+          echo "Building BOARD=$BOARD $EXTRA"
+          make -C micropython/ports/rp2 BOARD=$BOARD USER_C_MODULES=$GITHUB_WORKSPACE/usermod/micropython.cmake $EXTRA -j4
 
       - name: Upload UF2
         uses: actions/upload-artifact@v4
         with:
-          name: tinyos-picow-firmware
-          path: micropython/ports/rp2/build-RPI_PICO_W/firmware.uf2
+          name: tinyos-firmware
+          path: micropython/ports/rp2/build-${{ inputs.board || 'RPI_PICO_W' }}/firmware.uf2

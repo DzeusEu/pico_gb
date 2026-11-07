@@ -2,11 +2,21 @@
 // Peanut-GB (c) Mahyar Koshkouei, MIT license: https://github.com/deltabeard/Peanut-GB
 //
 //   import gbemu
-//   emu = gbemu.Emu(open("game.gb", "rb"), slots)   # ROM stays on the SD card
-//   emu.display(lcd.blit, x, y, mode)               # mode 0 = 160x144, 1 = 240x216
-//   emu.palette(c0, c1, c2, c3)                     # 4 shades, lightest first
-//   emu.frame(buttons, draw)                        # run one frame (~16.7 ms of game time)
+//   emu = gbemu.Emu(open("game.gb", "rb"), slots)      # ROM stays on the SD card
+//   emu.display_hw(spi_id, dc, cs, x, y, mode, baud)   # stream frames to the ST7789 by DMA
+//   emu.display(blit, x, y, mode)                      # (fallback) call a Python blit function
+//   emu.palette(c0, c1, c2, c3)                        # 4 shades, lightest first
+//   emu.options(frame_skip)                            # draw only every other frame
+//   emu.frame(buttons, draw=True)                      # run one frame (~16.7 ms of game time)
+//   emu.sync()                                         # wait until the display transfer is done
+//   emu.stats()                                        # (rom bank loads, load us, display wait us)
 //   emu.ram() / emu.dirty() / emu.title()
+//
+// mode 0 = 160x144, mode 1 = 240x216 (1.5x).
+//
+// Display path: finished lines are collected in two small strip buffers. While one strip is
+// sent to the screen by DMA, the CPU keeps emulating and fills the other one, so the (slow)
+// SPI transfer no longer stalls the emulator.
 //
 // ROM banks are cached in RAM (bank 0 always resident, plus `slots` x 16 KB with LRU
 // replacement) and fetched from the file on demand, so ROMs far bigger than RAM work.
@@ -18,6 +28,11 @@
 #include "py/objarray.h"
 #include "py/stream.h"
 #include "py/mperrno.h"
+#include "py/mphal.h"
+
+#include "hardware/gpio.h"
+#include "hardware/spi.h"
+#include "hardware/dma.h"
 
 #define ENABLE_LCD 1
 #define ENABLE_SOUND 0
@@ -25,8 +40,8 @@
 #include "peanut_gb.h"
 
 #define GBE_BANK 16384
-#define GBE_MAXS 8
-#define GBE_OUT_LINES 12
+#define GBE_MAXS 10
+#define GBE_STRIP 8             // lines per display strip buffer
 #define GBE_MAX_RAM 32768
 
 // button bits expected from Python (same as buttons.py)
@@ -60,11 +75,18 @@ typedef struct _gbe_obj_t {
     uint16_t pal[4];
     int ox, oy, mode;
     bool draw_on;
-    int pending, pend_y;
-    uint16_t obuf[GBE_OUT_LINES * 240];
+    int pending, pend_y, cur;
+    bool hw, dma_busy;
+    spi_inst_t *spi;
+    unsigned dc, cs;
+    uint32_t st_loads, st_load_us, st_wait_us;
+    uint16_t sbuf[2][GBE_STRIP * 240];
 } gbe_obj_t;
 
 extern const mp_obj_type_t gbe_type;
+
+// one DMA channel, claimed on first use and kept for the life of the firmware
+static int gbe_dma = -1;
 
 // ------------------------------------------------------------------ ROM access
 
@@ -115,7 +137,10 @@ static uint8_t *gbe_load_bank(gbe_obj_t *self, uint32_t bank) {
             self->last_bank = -1;
         }
         self->slot_bank[slot] = -1;  // stays invalid if the read below raises
+        uint32_t t0 = mp_hal_ticks_us();
         gbe_read_at(self, bank * GBE_BANK, self->cache + (size_t)slot * GBE_BANK, GBE_BANK);
+        self->st_load_us += mp_hal_ticks_us() - t0;
+        self->st_loads++;
         self->slot_bank[slot] = (int32_t)bank;
     }
     self->slot_use[slot] = ++self->tick;
@@ -160,44 +185,115 @@ static void gbe_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t
 
 // ------------------------------------------------------------------ display output
 
+// Wait for a running strip transfer (and the SPI shift register) to finish, release CS.
+static void gbe_dma_wait(gbe_obj_t *self) {
+    if (!self->dma_busy) {
+        return;
+    }
+    uint32_t t0 = mp_hal_ticks_us();
+    dma_channel_wait_for_finish_blocking((uint)gbe_dma);
+    while (spi_get_hw(self->spi)->sr & SPI_SSPSR_BSY_BITS) {
+        tight_loop_contents();
+    }
+    while (spi_is_readable(self->spi)) {
+        (void)spi_get_hw(self->spi)->dr;
+    }
+    spi_get_hw(self->spi)->icr = SPI_SSPICR_RORIC_BITS;
+    gpio_put(self->cs, 1);
+    self->dma_busy = false;
+    self->st_wait_us += mp_hal_ticks_us() - t0;
+}
+
+static void gbe_cmd(gbe_obj_t *self, uint8_t cmd, const uint8_t *data, size_t n) {
+    gpio_put(self->cs, 0);
+    gpio_put(self->dc, 0);
+    spi_write_blocking(self->spi, &cmd, 1);
+    if (n) {
+        gpio_put(self->dc, 1);
+        spi_write_blocking(self->spi, data, n);
+    }
+    gpio_put(self->cs, 1);
+}
+
 static void gbe_flush(gbe_obj_t *self) {
     if (self->pending == 0) {
         return;
     }
     int outw = self->mode == 0 ? 160 : 240;
-    mp_obj_t args[5];
-    args[0] = mp_obj_new_memoryview('B', (size_t)self->pending * outw * 2, self->obuf);
-    args[1] = MP_OBJ_NEW_SMALL_INT(self->ox);
-    args[2] = MP_OBJ_NEW_SMALL_INT(self->oy + self->pend_y);
-    args[3] = MP_OBJ_NEW_SMALL_INT(outw);
-    args[4] = MP_OBJ_NEW_SMALL_INT(self->pending);
+    uint16_t *buf = self->sbuf[self->cur];
+    int nl = self->pending;
+    int y0 = self->oy + self->pend_y;
     self->pending = 0;
+
+    if (self->hw) {
+        gbe_dma_wait(self);  // previous strip must be out before we touch the bus again
+        uint8_t d[4];
+        int x0 = self->ox;
+        int x1 = x0 + outw - 1;
+        d[0] = x0 >> 8;
+        d[1] = x0 & 0xFF;
+        d[2] = x1 >> 8;
+        d[3] = x1 & 0xFF;
+        gbe_cmd(self, 0x2A, d, 4);
+        int y1 = y0 + nl - 1;
+        d[0] = y0 >> 8;
+        d[1] = y0 & 0xFF;
+        d[2] = y1 >> 8;
+        d[3] = y1 & 0xFF;
+        gbe_cmd(self, 0x2B, d, 4);
+
+        // RAM write command, then stream the pixels with CS held low
+        const uint8_t ramwr = 0x2C;
+        gpio_put(self->cs, 0);
+        gpio_put(self->dc, 0);
+        spi_write_blocking(self->spi, &ramwr, 1);
+        gpio_put(self->dc, 1);
+        dma_channel_config c = dma_channel_get_default_config((uint)gbe_dma);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+        channel_config_set_dreq(&c, spi_get_dreq(self->spi, true));
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        dma_channel_configure((uint)gbe_dma, &c, &spi_get_hw(self->spi)->dr, buf,
+            (uint32_t)(nl * outw * 2), true);
+        self->dma_busy = true;
+        self->cur ^= 1;  // keep rendering into the other buffer
+        return;
+    }
+
+    // fallback: call the Python blit function (blocking)
+    mp_obj_t args[5];
+    args[0] = mp_obj_new_memoryview('B', (size_t)nl * outw * 2, buf);
+    args[1] = MP_OBJ_NEW_SMALL_INT(self->ox);
+    args[2] = MP_OBJ_NEW_SMALL_INT(y0);
+    args[3] = MP_OBJ_NEW_SMALL_INT(outw);
+    args[4] = MP_OBJ_NEW_SMALL_INT(nl);
     mp_call_function_n_kw(self->draw, 5, 0, args);
 }
 
 static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line) {
     gbe_obj_t *self = (gbe_obj_t *)gb->direct.priv;
-    if (!self->draw_on || self->draw == mp_const_none) {
+    if (!self->draw_on || (!self->hw && self->draw == mp_const_none)) {
         return;
     }
     const uint16_t *pal = self->pal;
+    uint16_t *base = self->sbuf[self->cur];
     if (self->mode == 0) {
         if (self->pending == 0) {
             self->pend_y = line;
         }
-        uint16_t *row = self->obuf + self->pending * 160;
+        uint16_t *row = base + self->pending * 160;
         for (int x = 0; x < 160; x++) {
             row[x] = pal[pixels[x] & 3];
         }
         self->pending++;
     } else {
-        // 1.5x nearest neighbour: 160x144 -> 240x216
+        // 1.5x nearest neighbour: 160x144 -> 240x216 (every 2 source lines give 3 output lines)
         int start = (3 * (int)line + 1) / 2;
         int count = (line & 1) ? 1 : 2;
         if (self->pending == 0) {
             self->pend_y = start;
         }
-        uint16_t *row = self->obuf + self->pending * 240;
+        uint16_t *row = base + self->pending * 240;
         int o = 0;
         for (int x = 0; x < 160; x += 2) {
             uint16_t c0 = pal[pixels[x] & 3];
@@ -211,7 +307,7 @@ static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast
         }
         self->pending += count;
     }
-    if (self->pending + 2 > GBE_OUT_LINES) {
+    if (self->pending + 2 > GBE_STRIP) {
         gbe_flush(self);
     }
 }
@@ -299,9 +395,11 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     return MP_OBJ_FROM_PTR(self);
 }
 
-// display(callback, x, y, mode)
+// display(callback, x, y, mode) - Python blit fallback: callback(buf, x, y, w, h)
 static mp_obj_t gbe_display(size_t n_args, const mp_obj_t *args) {
     gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    gbe_dma_wait(self);
+    self->hw = false;
     self->draw = args[1];
     self->ox = mp_obj_get_int(args[2]);
     self->oy = mp_obj_get_int(args[3]);
@@ -310,6 +408,38 @@ static mp_obj_t gbe_display(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_display_obj, 5, 5, gbe_display);
+
+// display_hw(spi_id, dc_gpio, cs_gpio, x, y, mode, baud) - DMA straight to the ST7789.
+// baud > 0 sets the SPI clock of that bus; call again after changing machine.freq().
+static mp_obj_t gbe_display_hw(size_t n_args, const mp_obj_t *args) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    gbe_dma_wait(self);
+    int spi_id = mp_obj_get_int(args[1]);
+    if (spi_id < 0 || spi_id > 1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("bad SPI id"));
+    }
+    if (gbe_dma < 0) {
+        int ch = dma_claim_unused_channel(false);
+        if (ch < 0) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("no free DMA channel"));
+        }
+        gbe_dma = ch;
+    }
+    self->spi = spi_id ? spi1 : spi0;
+    self->dc = (unsigned)mp_obj_get_int(args[2]);
+    self->cs = (unsigned)mp_obj_get_int(args[3]);
+    self->ox = mp_obj_get_int(args[4]);
+    self->oy = mp_obj_get_int(args[5]);
+    self->mode = mp_obj_get_int(args[6]) ? 1 : 0;
+    int baud = mp_obj_get_int(args[7]);
+    if (baud > 0) {
+        spi_set_baudrate(self->spi, (unsigned)baud);
+    }
+    self->hw = true;
+    self->pending = 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_display_hw_obj, 8, 8, gbe_display_hw);
 
 // palette(c0, c1, c2, c3)  - values as produced by st7789.rgb()
 static mp_obj_t gbe_palette(size_t n_args, const mp_obj_t *args) {
@@ -320,6 +450,14 @@ static mp_obj_t gbe_palette(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_palette_obj, 5, 5, gbe_palette);
+
+// options(frame_skip) - when true Peanut-GB renders only every other frame (saves CPU + bandwidth)
+static mp_obj_t gbe_options(mp_obj_t self_in, mp_obj_t frame_skip) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    self->gb.direct.frame_skip = mp_obj_is_true(frame_skip) ? 1 : 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(gbe_options_obj, gbe_options);
 
 // frame(buttons, draw=True)
 static mp_obj_t gbe_frame(size_t n_args, const mp_obj_t *args) {
@@ -341,9 +479,34 @@ static mp_obj_t gbe_frame(size_t n_args, const mp_obj_t *args) {
     self->pending = 0;
     gb_run_frame(&self->gb);
     gbe_flush(self);
+    gbe_dma_wait(self);  // leave the bus idle so Python can use the display between frames
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_frame_obj, 2, 3, gbe_frame);
+
+// sync() - wait for any running display transfer (call before drawing with Python)
+static mp_obj_t gbe_sync(mp_obj_t self_in) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    gbe_dma_wait(self);
+    self->pending = 0;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(gbe_sync_obj, gbe_sync);
+
+// stats() -> (rom bank loads, microseconds spent loading, microseconds waiting for the display)
+// and resets the counters.
+static mp_obj_t gbe_stats(mp_obj_t self_in) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    mp_obj_t t[3];
+    t[0] = mp_obj_new_int_from_uint(self->st_loads);
+    t[1] = mp_obj_new_int_from_uint(self->st_load_us);
+    t[2] = mp_obj_new_int_from_uint(self->st_wait_us);
+    self->st_loads = 0;
+    self->st_load_us = 0;
+    self->st_wait_us = 0;
+    return mp_obj_new_tuple(3, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(gbe_stats_obj, gbe_stats);
 
 // ram() -> memoryview of cartridge RAM (battery save) or None
 static mp_obj_t gbe_ram(mp_obj_t self_in) {
@@ -382,8 +545,12 @@ static MP_DEFINE_CONST_FUN_OBJ_1(gbe_title_obj, gbe_title);
 
 static const mp_rom_map_elem_t gbe_locals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_display), MP_ROM_PTR(&gbe_display_obj)},
+    {MP_ROM_QSTR(MP_QSTR_display_hw), MP_ROM_PTR(&gbe_display_hw_obj)},
     {MP_ROM_QSTR(MP_QSTR_palette), MP_ROM_PTR(&gbe_palette_obj)},
+    {MP_ROM_QSTR(MP_QSTR_options), MP_ROM_PTR(&gbe_options_obj)},
     {MP_ROM_QSTR(MP_QSTR_frame), MP_ROM_PTR(&gbe_frame_obj)},
+    {MP_ROM_QSTR(MP_QSTR_sync), MP_ROM_PTR(&gbe_sync_obj)},
+    {MP_ROM_QSTR(MP_QSTR_stats), MP_ROM_PTR(&gbe_stats_obj)},
     {MP_ROM_QSTR(MP_QSTR_ram), MP_ROM_PTR(&gbe_ram_obj)},
     {MP_ROM_QSTR(MP_QSTR_dirty), MP_ROM_PTR(&gbe_dirty_obj)},
     {MP_ROM_QSTR(MP_QSTR_title), MP_ROM_PTR(&gbe_title_obj)},

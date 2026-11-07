@@ -3,7 +3,7 @@
 import sys
 
 
-def run(tos, path):
+def run(tos, path=None):
     import gb
     try:
         gb.run(tos, path)
