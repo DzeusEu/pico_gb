@@ -51,6 +51,7 @@ PALETTES = (
 CORE_BYTES = 41 * 1024
 RESERVE = 14 * 1024
 BANK = 16384
+PAGE = 4096                  # ROM cache page size used by the C module
 RAM_SIZES = (0, 2048, 8192, 32768, 32768, 32768)   # header code -> bytes (capped at 32 KB)
 
 
@@ -163,10 +164,11 @@ def run(tos, path=None):
         try:
             banks, ram = _plan(f)
             free = gc.mem_free()
-            slots = (free - CORE_BYTES - ram - RESERVE) // BANK
-            slots = max(1, min(slots, banks - 1, 10))
+            table = 2 * 4 * banks                    # page table of the C module
+            slots = (free - CORE_BYTES - ram - RESERVE - table) // (PAGE + 8)
+            slots = max(4, min(slots, (banks - 1) * 4, 250))
         except Exception:
-            banks, ram, slots = 2, 0, 3
+            banks, ram, slots = 2, 0, 16
         try:
             while True:
                 try:
@@ -174,14 +176,14 @@ def run(tos, path=None):
                     break
                 except MemoryError:
                     gc.collect()
-                    if slots <= 1:
+                    if slots <= 4:
                         break
-                    slots -= 1
+                    slots -= 4
         except ValueError as e:
             tos.message("Game Boy", str(e), tos.RED)
             return
         if emu is None:
-            need = (CORE_BYTES + ram + BANK + RESERVE) // 1024
+            need = (CORE_BYTES + ram + 4 * PAGE + RESERVE) // 1024
             tos.message("Game Boy", "Za mało wolnej pamięci RAM: wolne %d KB, potrzeba ok. %d KB. Zobacz BUILD.md (zamroź system / zbuduj dla RPI_PICO)." % (gc.mem_free() // 1024, need), tos.RED)
             return
 
@@ -262,8 +264,8 @@ def run(tos, path=None):
                     set_clock(bool(st["oc"]))
                 elif what == "diag":
                     tos.message("Diagnostyka",
-                                "Prędkość: %d fps (60 = pełna)\nŁadowanie banków: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nSloty cache: %d z %d banków\nWolny RAM: %d KB\nZegar: %d MHz" % (
-                                    diag[0], diag[1], diag[2], diag[3], slots, banks - 1,
+                                "Prędkość: %d fps (60 = pełna)\nOdczyty ROM z SD: %d/s\nCzas ładowania: %d ms/s\nCzekanie na ekran: %d ms/s\nCache ROM: %d z %d stron 4 KB\nWolny RAM: %d KB\nZegar: %d MHz" % (
+                                    diag[0], diag[1], diag[2], diag[3], slots, (banks - 1) * 4,
                                     gc.mem_free() // 1024, freq() // 1000000))
                 elif what == "quit":
                     if tos.confirm("Zakończyć grę?"):

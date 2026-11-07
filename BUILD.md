@@ -71,7 +71,7 @@ Put `.gb` files on the SD card (for example `/sd/roms`) and open one in the file
 Send me this screen if a game is still slow:
 
 - **Speed** in fps.
-- **ROM bank loads/s** and **time loading**: big numbers mean the game keeps fetching ROM from the SD card (more RAM for the cache helps).
+- **ROM reads from SD per second** and **time loading**: big numbers mean the game keeps fetching ROM from the SD card (more RAM for the cache helps).
 - **Waiting for screen**: big numbers mean the display link is the limit (use frame skip, fast display clock, or 1x).
 - **Cache slots / free RAM**.
 
@@ -83,6 +83,10 @@ The emulator core only knows the **original Game Boy**. I found no Game Boy Colo
 - **Games that work on both** (most early colour releases) run in classic mode.
 - **Colour:** the palettes *Color A/B/C* colour the background and the two sprite palettes separately, the way a Game Boy Color tints old games. This is a tint, not the game's own colour graphics.
 - ROMs of colour cartridges are larger, so they load more banks from the SD card. If one is slow, check Diagnostics (*ROM bank loads/s*), try `GB_SD_BAUD = 20_000_000` in `config.py`, and give the cache more RAM (RPI_PICO build, frozen OS).
+
+## ROM cache (changed)
+
+The ROM cache now uses **4 KB pages** instead of 16 KB banks (same RAM, 4x more entries, each SD read about 4x cheaper). Games with big ROMs that used to drop to a few fps should improve a lot. This needs a **firmware rebuild** (C module changed) together with the new `emulators/gb.py`; the old `gb.py` will not work with the new firmware and the other way round.
 
 ## Limits
 

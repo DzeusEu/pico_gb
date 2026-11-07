@@ -18,7 +18,7 @@
 // sent to the screen by DMA, the CPU keeps emulating and fills the other one, so the (slow)
 // SPI transfer no longer stalls the emulator.
 //
-// ROM banks are cached in RAM (bank 0 always resident, plus `slots` x 16 KB with LRU
+// ROM is cached in RAM (bank 0 always resident, plus `slots` x 4 KB pages with LRU
 // replacement) and fetched from the file on demand, so ROMs far bigger than RAM work.
 
 #include <string.h>
@@ -40,7 +40,9 @@
 #include "peanut_gb.h"
 
 #define GBE_BANK 16384
-#define GBE_MAXS 10
+#define GBE_PAGE 4096           // ROM cache page (4 KB: cheaper SD reads, finer-grained cache)
+#define GBE_PSHIFT 12
+#define GBE_MAXS 250            // max cache pages
 #define GBE_STRIP 8             // lines per display strip buffer
 #define GBE_MAX_RAM 32768
 
@@ -64,10 +66,12 @@ typedef struct _gbe_obj_t {
     uint8_t *bank0;
     uint8_t *cache;
     int nslots;
-    int32_t slot_bank[GBE_MAXS];
-    uint32_t slot_use[GBE_MAXS];
+    int32_t *slot_page;       // page held by each cache slot (-1 = empty)
+    uint32_t *slot_use;
+    uint16_t *ptab;           // page number -> slot + 1 (0 = not cached)
+    uint32_t npages;
     uint32_t tick;
-    int32_t last_bank;
+    int32_t last_page;
     uint8_t *last_ptr;
     uint8_t *ram;
     uint32_t ram_size;
@@ -115,18 +119,12 @@ static void gbe_read_at(gbe_obj_t *self, uint32_t offset, uint8_t *dst, uint32_t
     }
 }
 
-static uint8_t *gbe_load_bank(gbe_obj_t *self, uint32_t bank) {
-    int slot = -1;
-    for (int i = 0; i < self->nslots; i++) {
-        if (self->slot_bank[i] == (int32_t)bank) {
-            slot = i;
-            break;
-        }
-    }
+static uint8_t *gbe_load_page(gbe_obj_t *self, uint32_t page) {
+    int slot = (int)self->ptab[page] - 1;
     if (slot < 0) {
         uint32_t oldest = 0xFFFFFFFFu;
         for (int i = 0; i < self->nslots; i++) {
-            if (self->slot_bank[i] < 0) {
+            if (self->slot_page[i] < 0) {
                 slot = i;
                 break;
             }
@@ -135,19 +133,23 @@ static uint8_t *gbe_load_bank(gbe_obj_t *self, uint32_t bank) {
                 slot = i;
             }
         }
-        if (self->last_bank == self->slot_bank[slot]) {
-            self->last_bank = -1;
+        if (self->slot_page[slot] >= 0) {
+            self->ptab[self->slot_page[slot]] = 0;
+            if (self->last_page == self->slot_page[slot]) {
+                self->last_page = -1;
+            }
         }
-        self->slot_bank[slot] = -1;  // stays invalid if the read below raises
+        self->slot_page[slot] = -1;  // stays invalid if the read below raises
         uint32_t t0 = mp_hal_ticks_us();
-        gbe_read_at(self, bank * GBE_BANK, self->cache + (size_t)slot * GBE_BANK, GBE_BANK);
+        gbe_read_at(self, page << GBE_PSHIFT, self->cache + (size_t)slot * GBE_PAGE, GBE_PAGE);
         self->st_load_us += mp_hal_ticks_us() - t0;
         self->st_loads++;
-        self->slot_bank[slot] = (int32_t)bank;
+        self->slot_page[slot] = (int32_t)page;
+        self->ptab[page] = (uint16_t)(slot + 1);
     }
     self->slot_use[slot] = ++self->tick;
-    self->last_bank = (int32_t)bank;
-    self->last_ptr = self->cache + (size_t)slot * GBE_BANK;
+    self->last_page = (int32_t)page;
+    self->last_ptr = self->cache + (size_t)slot * GBE_PAGE;
     return self->last_ptr;
 }
 
@@ -158,11 +160,21 @@ static uint8_t gbe_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
     if (addr < GBE_BANK) {
         return self->bank0[addr];
     }
-    uint32_t bank = (uint32_t)(addr >> 14);
-    if ((int32_t)bank == self->last_bank) {
-        return self->last_ptr[addr & (GBE_BANK - 1)];
+    uint32_t page = (uint32_t)(addr >> GBE_PSHIFT);
+    if ((int32_t)page == self->last_page) {
+        return self->last_ptr[addr & (GBE_PAGE - 1)];
     }
-    return gbe_load_bank(self, bank)[addr & (GBE_BANK - 1)];
+    if (page >= self->npages) {
+        return 0xFF;
+    }
+    uint32_t slot = self->ptab[page];
+    if (slot) {
+        self->slot_use[slot - 1] = ++self->tick;
+        self->last_page = (int32_t)page;
+        self->last_ptr = self->cache + (size_t)(slot - 1) * GBE_PAGE;
+        return self->last_ptr[addr & (GBE_PAGE - 1)];
+    }
+    return gbe_load_page(self, page)[addr & (GBE_PAGE - 1)];
 }
 
 static uint8_t gbe_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr) {
@@ -331,7 +343,7 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     enum { ARG_file, ARG_slots };
     static const mp_arg_t allowed[] = {
         {MP_QSTR_file, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
-        {MP_QSTR_slots, MP_ARG_INT, {.u_int = 3}},
+        {MP_QSTR_slots, MP_ARG_INT, {.u_int = 16}},
     };
     mp_arg_val_t a[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all_kw_array(n_args, n_kw, args, MP_ARRAY_SIZE(allowed), allowed, a);
@@ -351,16 +363,13 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->stream = mp_get_stream(self->file);
     self->draw = mp_const_none;
     self->nslots = slots;
-    self->last_bank = -1;
+    self->last_page = -1;
     self->mode = 1;
     static const uint16_t shades[4] = {0xFFFF, 0xAAAA, 0x5555, 0x0000};
     for (int s = 0; s < 4; s++) {
         for (int c = 0; c < 4; c++) {
             self->lut[(s << 4) | c] = shades[c];
         }
-    }
-    for (int i = 0; i < GBE_MAXS; i++) {
-        self->slot_bank[i] = -1;
     }
 
     // ROM size
@@ -376,7 +385,23 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 
     // buffers (GC heap; freed when the object is collected)
     self->bank0 = m_new(uint8_t, GBE_BANK);
-    self->cache = m_new(uint8_t, (size_t)slots * GBE_BANK);
+    self->npages = (self->rom_size + GBE_PAGE - 1) >> GBE_PSHIFT;
+    if (self->npages > 4096) {
+        self->npages = 4096;
+    }
+    if ((uint32_t)slots > self->npages) {
+        slots = (int)self->npages;
+        self->nslots = slots;
+    }
+    self->cache = m_new(uint8_t, (size_t)slots * GBE_PAGE);
+    self->slot_page = m_new(int32_t, slots);
+    self->slot_use = m_new(uint32_t, slots);
+    self->ptab = m_new(uint16_t, self->npages);
+    memset(self->ptab, 0, self->npages * sizeof(uint16_t));
+    for (int i = 0; i < slots; i++) {
+        self->slot_page[i] = -1;
+        self->slot_use[i] = 0;
+    }
     gbe_read_at(self, 0, self->bank0, GBE_BANK);
 
     self->ram_size = gbe_ram_size(self->bank0);
