@@ -72,7 +72,9 @@ typedef struct _gbe_obj_t {
     uint8_t *ram;
     uint32_t ram_size;
     bool dirty;
-    uint16_t pal[4];
+    // colour lookup, index = pixel & 0x33: bits 5-4 select the layer (0 OBJ0, 1 OBJ1, 2 BG),
+    // bits 1-0 the shade. Lets a DMG game be coloured like the Game Boy Color did.
+    uint16_t lut[64];
     int ox, oy, mode;
     bool draw_on;
     int pending, pend_y, cur;
@@ -275,7 +277,7 @@ static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast
     if (!self->draw_on || (!self->hw && self->draw == mp_const_none)) {
         return;
     }
-    const uint16_t *pal = self->pal;
+    const uint16_t *lut = self->lut;
     uint16_t *base = self->sbuf[self->cur];
     if (self->mode == 0) {
         if (self->pending == 0) {
@@ -283,7 +285,7 @@ static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast
         }
         uint16_t *row = base + self->pending * 160;
         for (int x = 0; x < 160; x++) {
-            row[x] = pal[pixels[x] & 3];
+            row[x] = lut[pixels[x] & 0x33];
         }
         self->pending++;
     } else {
@@ -296,8 +298,8 @@ static void gbe_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast
         uint16_t *row = base + self->pending * 240;
         int o = 0;
         for (int x = 0; x < 160; x += 2) {
-            uint16_t c0 = pal[pixels[x] & 3];
-            uint16_t c1 = pal[pixels[x + 1] & 3];
+            uint16_t c0 = lut[pixels[x] & 0x33];
+            uint16_t c1 = lut[pixels[x + 1] & 0x33];
             row[o++] = c0;
             row[o++] = c0;
             row[o++] = c1;
@@ -351,10 +353,12 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
     self->nslots = slots;
     self->last_bank = -1;
     self->mode = 1;
-    self->pal[0] = 0xFFFF;
-    self->pal[1] = 0xAAAA;
-    self->pal[2] = 0x5555;
-    self->pal[3] = 0x0000;
+    static const uint16_t shades[4] = {0xFFFF, 0xAAAA, 0x5555, 0x0000};
+    for (int s = 0; s < 4; s++) {
+        for (int c = 0; c < 4; c++) {
+            self->lut[(s << 4) | c] = shades[c];
+        }
+    }
     for (int i = 0; i < GBE_MAXS; i++) {
         self->slot_bank[i] = -1;
     }
@@ -441,15 +445,32 @@ static mp_obj_t gbe_display_hw(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_display_hw_obj, 8, 8, gbe_display_hw);
 
-// palette(c0, c1, c2, c3)  - values as produced by st7789.rgb()
+// palette(bg0..bg3)                          - one 4-shade palette for everything
+// palette(bg0..bg3, o0_0..o0_3, o1_0..o1_3)  - separate background / sprite palette 0 / sprite palette 1
+// shades are lightest first, values as produced by st7789.rgb()
 static mp_obj_t gbe_palette(size_t n_args, const mp_obj_t *args) {
     gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    for (int i = 0; i < 4; i++) {
-        self->pal[i] = (uint16_t)mp_obj_get_int(args[1 + i]);
+    if (n_args != 5 && n_args != 13) {
+        mp_raise_ValueError(MP_ERROR_TEXT("palette needs 4 or 12 colours"));
+    }
+    uint16_t c[12];
+    int n = (int)n_args - 1;
+    for (int i = 0; i < n; i++) {
+        c[i] = (uint16_t)mp_obj_get_int(args[1 + i]);
+    }
+    for (int s = 0; s < 4; s++) {
+        // layer index -> colours: 0 = OBJ0, 1 = OBJ1, 2 = BG (3 is undefined; use BG)
+        int src = 0;  // offset into c[]
+        if (n == 12) {
+            src = (s == 0) ? 4 : (s == 1) ? 8 : 0;
+        }
+        for (int k = 0; k < 4; k++) {
+            self->lut[(s << 4) | k] = c[src + k];
+        }
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_palette_obj, 5, 5, gbe_palette);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_palette_obj, 5, 13, gbe_palette);
 
 // options(frame_skip) - when true Peanut-GB renders only every other frame (saves CPU + bandwidth)
 static mp_obj_t gbe_options(mp_obj_t self_in, mp_obj_t frame_skip) {
