@@ -300,16 +300,16 @@ static mp_obj_t gbe_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 }
 
 // display(callback, x, y, mode)
-static mp_obj_t gbe_display(mp_obj_t self_in, mp_obj_t cb, mp_obj_t x, mp_obj_t y, mp_obj_t mode) {
-    gbe_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    self->draw = cb;
-    self->ox = mp_obj_get_int(x);
-    self->oy = mp_obj_get_int(y);
-    self->mode = mp_obj_get_int(mode) ? 1 : 0;
+static mp_obj_t gbe_display(size_t n_args, const mp_obj_t *args) {
+    gbe_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    self->draw = args[1];
+    self->ox = mp_obj_get_int(args[2]);
+    self->oy = mp_obj_get_int(args[3]);
+    self->mode = mp_obj_get_int(args[4]) ? 1 : 0;
     self->pending = 0;
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_5(gbe_display_obj, gbe_display);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(gbe_display_obj, 5, 5, gbe_display);
 
 // palette(c0, c1, c2, c3)  - values as produced by st7789.rgb()
 static mp_obj_t gbe_palette(size_t n_args, const mp_obj_t *args) {
