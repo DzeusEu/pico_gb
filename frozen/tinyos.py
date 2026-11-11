@@ -16,6 +16,24 @@ from st7789 import ST7789, rgb
 OS_NAME = "RTSP_OS"
 VERSION = "0.3"
 SD_DIR = "/sd"
+
+# sound effects: lists of (frequency Hz, ms); frequency 0 = pause
+SFX = {
+    "startup": ((523, 80), (659, 80), (784, 80), (1047, 170), (0, 50), (784, 70), (1047, 80), (1319, 260)),
+    "shutdown": ((1319, 80), (1047, 80), (784, 80), (659, 80), (523, 240)),
+    "ok": ((1200, 22), (1800, 32)),
+    "back": ((1500, 20), (950, 30)),
+    "msg": ((1700, 25), (1300, 30)),
+    "error": ((240, 130), (170, 220)),
+    "on": ((1100, 22), (1700, 34)),
+    "off": ((1700, 22), (1100, 34)),
+    "vert": ((1500, 4),),
+    "horiz": ((1000, 6),),
+    "start": ((1100, 10),),
+    "game": ((659, 60), (880, 60), (1175, 110)),
+    "save": ((1500, 30), (0, 20), (1500, 30), (2000, 60)),
+}
+VOLUME = (0, 6000, 16000, 32768)   # PWM duty for volume 0..3
 TURBO_HZ = 250_000_000
 HEADER_H = 20
 FOOTER_H = 16
@@ -69,7 +87,7 @@ class System:
 
         # settings (saved in /data/settings.json, defaults from config.py)
         self.s = {"sound": 1, "invert": 1 if config.LCD_INVERT else 0,
-                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION, "splash": 1, "turbo": 1}
+                  "bgr": 1 if config.LCD_BGR else 0, "rot": config.LCD_ROTATION, "splash": 1, "turbo": 1, "vol": 2}
         saved = self.load("settings", None)
         if isinstance(saved, dict):
             for k in self.s:
@@ -91,6 +109,7 @@ class System:
         if config.PIN_BUZZER is not None:
             self.pwm = PWM(Pin(config.PIN_BUZZER))
             self.pwm.duty_u16(0)
+            self.btn.hook = self.key_sound
         self.sd = None
         self.sd_error = ""
         self.sd_mount()
@@ -209,9 +228,41 @@ class System:
         if not self.pwm or not self.s["sound"]:
             return
         self.pwm.freq(hz)
-        self.pwm.duty_u16(16000)
+        self.pwm.duty_u16(VOLUME[self.s.get("vol", 2)])
         time.sleep_ms(ms)
         self.pwm.duty_u16(0)
+
+    def tune(self, notes):
+        """Play (Hz, ms) notes; blocks until done."""
+        if not self.pwm or not self.s["sound"]:
+            return
+        duty = VOLUME[self.s.get("vol", 2)]
+        for hz, ms in notes:
+            if hz:
+                self.pwm.freq(hz)
+                self.pwm.duty_u16(duty)
+            else:
+                self.pwm.duty_u16(0)
+            time.sleep_ms(ms)
+        self.pwm.duty_u16(0)
+
+    def sfx(self, name):
+        n = SFX.get(name)
+        if n:
+            self.tune(n)
+
+    def key_sound(self, k):
+        """Sound for every new button press (menus, file browser, XMB)."""
+        if k & A:
+            self.tune(SFX["ok"])
+        elif k & B:
+            self.tune(SFX["back"])
+        elif k & (UP | DOWN):
+            self.tune(SFX["vert"])
+        elif k & (LEFT | RIGHT):
+            self.tune(SFX["horiz"])
+        elif k & START:
+            self.tune(SFX["start"])
 
     # ------------------------------------------------------------ drawing helpers
     def clear(self, color=None):
@@ -320,6 +371,7 @@ class System:
             self.lcd.text(ln, 8, y, color or self.WHITE, self.BG)
             y += 12
         self.footer("A/B: OK")
+        self.sfx("error" if color in (self.RED, self.ORANGE) else "msg")
         while not (self.btn.wait() & (A | B)):
             pass
 
@@ -387,6 +439,9 @@ class System:
             sys.path.insert(0, d)
             added = True
         gc.collect()
+        hook = self.btn.hook
+        self.btn.hook = None          # games make their own sounds
+        self.sfx("game")
         try:
             mod = __import__(name)
             getattr(mod, entry)(self, *args)
@@ -396,6 +451,7 @@ class System:
             self.btn.release()
             self.viewer("Błąd: " + fname, buf.getvalue())
         finally:
+            self.btn.hook = hook
             sys.modules.pop(name, None)
             if added and d in sys.path:
                 sys.path.remove(d)
@@ -435,6 +491,7 @@ class System:
 
     def splash(self):
         if not self.s.get("splash", 1):
+            self.sfx("startup")
             return
         shown = False
         for p in ("/splash.raw", SD_DIR + "/splash.raw"):
@@ -445,7 +502,8 @@ class System:
             except Exception:
                 pass
         if shown:
-            time.sleep_ms(1800)
+            self.sfx("startup")
+            time.sleep_ms(900)
             return
         self.clear(rgb(8, 16, 60))
         self.ctext("RTSP_OS", 70, self.WHITE, rgb(8, 16, 60), 5)
@@ -455,7 +513,8 @@ class System:
             self.ctext("Karta SD: OK", 175, self.GREEN, rgb(8, 16, 60))
         elif getattr(config, "SD_CS", None) is not None:
             self.ctext("Karta SD: nie znaleziono", 175, self.ORANGE, rgb(8, 16, 60))
-        time.sleep_ms(900 if self.sd or getattr(config, "SD_CS", None) is None else 1500)
+        self.sfx("startup")
+        time.sleep_ms(600 if self.sd or getattr(config, "SD_CS", None) is None else 1200)
 
     def list_games(self):
         """[(title, path, where)] for /games and /sd/games."""
@@ -522,9 +581,15 @@ class System:
         elif name == "turbo":
             s["turbo"] = 0 if s.get("turbo", 1) else 1
             self.apply_clock()
+        elif name == "vol":
+            s["vol"] = s.get("vol", 2) % 3 + 1
+            self.beep(1500, 40)
         elif name == "splash":
             s["splash"] = 0 if s.get("splash", 1) else 1
         self.save_settings()
+        if name != "vol":
+            val = (s["rot"] == 3) if name == "rot" else s.get(name, 1)
+            self.sfx("on" if val else "off")
 
     def power_off(self):
         """Software power off: screen and backlight off, clock down; hold START to wake up.
@@ -533,12 +598,19 @@ class System:
         self.sd_unmount()
         self.clear(rgb(0, 0, 0))
         self.ctext("Do zobaczenia!", 110, self.WHITE, rgb(0, 0, 0), 2)
-        time.sleep_ms(700)
+        self.sfx("shutdown")
+        time.sleep_ms(300)
         bl = getattr(config, "PIN_BL", None)
         if bl is not None:
             Pin(bl, Pin.OUT).value(0)
-        self.lcd._cmd(0x28)            # display off
-        self.lcd._cmd(0x10)            # sleep in
+        # Without a backlight pin the light stays on anyway. Panels used with colour inversion show
+        # white when the controller is switched off, so by default the screen is just filled
+        # black (looks darkest). Set POWER_PANEL_OFF = True in config.py to also switch the panel off.
+        panel_off = getattr(config, "POWER_PANEL_OFF", False)
+        self.clear(rgb(0, 0, 0))
+        if panel_off:
+            self.lcd._cmd(0x28)        # display off
+            self.lcd._cmd(0x10)        # sleep in
         freq(20_000_000)
         self.btn.release()
         t0 = None
@@ -552,9 +624,10 @@ class System:
                 t0 = None
             time.sleep_ms(40)
         self.apply_clock()
-        self.lcd._cmd(0x11)            # sleep out
-        time.sleep_ms(130)
-        self.lcd._cmd(0x29)            # display on
+        if panel_off:
+            self.lcd._cmd(0x11)        # sleep out
+            time.sleep_ms(130)
+            self.lcd._cmd(0x29)        # display on
         if bl is not None:
             Pin(bl, Pin.OUT).value(1)
         self.beep()

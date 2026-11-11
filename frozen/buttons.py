@@ -25,6 +25,7 @@ class Buttons:
                 self._pins.append((Pin(gp, Pin.IN, Pin.PULL_UP), bit))
         self._last = 0
         self._next = 0
+        self.hook = None          # called with the mask of new presses (used for key sounds)
 
     def read(self):
         """Bitmask of buttons currently held down."""
@@ -46,6 +47,8 @@ class Buttons:
         elif new:
             self._next = time.ticks_add(now, 350)
         self._last = m
+        if new and self.hook:
+            self.hook(new)
         return new
 
     def wait(self):

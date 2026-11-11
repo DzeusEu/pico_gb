@@ -100,9 +100,13 @@ For the screen wait: pause menu -> *Skala* 1x and *Zegar ekranu* SZYBKI cut the 
 - **Emulator core in RAM.** The workflow option `ram_code` (default on) moves the hot Peanut-GB functions from flash to RAM, which usually speeds the CPU emulation up noticeably. It costs about 20 KB of RAM; switch it off if a game complains about memory.
 - **Turbo 250 MHz** (Ustawienia, default on): the whole system, including the XMB menu animation, runs at 250 MHz with the display clock at 62.5 MHz (`SPI_BAUD_TURBO` in `config.py` if you want another value). Switch it off if you get glitches.
 
+## Sound
+
+In `config.py` set `PIN_BUZZER = 10` (buzzer + on GP10, - on GND; it was `None` before, which is why nothing was heard). Sounds: start-up jingle, key sounds (up/down, left/right, A, B, START), message/error tones, setting on/off tones, shutdown jingle, game start. Games keep their own effect sounds. Settings: *Dźwięk* (on/off) and *Głośność* (1 to 3). A passive buzzer gives real tones; an active buzzer just beeps at its own pitch.
+
 ## Power off / wake (START)
 
-In the XMB menu hold **START for about 4 seconds** (a progress bar appears) to switch the console "off": the SD card is unmounted, the screen and backlight go off and the CPU clock drops to 20 MHz. Hold START for 4 seconds again to wake it up (the splash screen appears). The same is available in *System > Wyłącz (uśpij)*.
+In the XMB menu hold **START for about 4 seconds** (a progress bar appears) to switch the console "off": the SD card is unmounted, the screen goes black (and the backlight off if `PIN_BL` is set) and the CPU clock drops to 20 MHz. Hold START for 4 seconds again to wake it up (the splash screen appears). The same is available in *System > Wyłącz (uśpij)*.
 
 A Pico has no real off state, so this is a low-power standby, not a power cut: a battery will still drain slowly (use a power switch for storage). Optional in `config.py`: `POWER_HOLD_MS = 4000` (hold time) and `PIN_BL = <gpio>` if your backlight is wired to a GPIO that can be switched off.
 

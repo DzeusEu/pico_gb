@@ -178,6 +178,7 @@ class XMB:
             s = tos.s
             onoff = lambda v: "WŁ." if v else "WYŁ."
             out.append(("Dźwięk", (lambda: tos.toggle_setting("sound")), onoff(s["sound"])))
+            out.append(("Głośność", (lambda: tos.toggle_setting("vol")), "%d/3" % s.get("vol", 2)))
             out.append(("Odwróć kolory", (lambda: tos.toggle_setting("invert")), onoff(s["invert"])))
             out.append(("Kolejność kolorów", (lambda: tos.toggle_setting("bgr")), "BGR" if s["bgr"] else "RGB"))
             out.append(("Obróć ekran", (lambda: tos.toggle_setting("rot")), "TAK" if s["rot"] == 3 else "NIE"))
