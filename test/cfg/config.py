@@ -43,3 +43,4 @@ SD_BAUD = 10_000_000   # lower to 4_000_000 if the card is flaky on long wires
 
 # Game Boy: SD clock used while a game is running (lower if you get read errors)
 GB_SD_BAUD = 16_000_000
+POWER_HOLD_MS = 1500

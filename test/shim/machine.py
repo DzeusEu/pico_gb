@@ -22,6 +22,7 @@ class SPI:
     LCD = None
     def __init__(self, id, **kw):
         self.id = id
+    def init(self, **kw): pass
     def write(self, data):
         if SPI.LCD is not None:
             SPI.LCD.write(bytes(data))

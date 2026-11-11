@@ -100,6 +100,12 @@ For the screen wait: pause menu -> *Skala* 1x and *Zegar ekranu* SZYBKI cut the 
 - **Emulator core in RAM.** The workflow option `ram_code` (default on) moves the hot Peanut-GB functions from flash to RAM, which usually speeds the CPU emulation up noticeably. It costs about 20 KB of RAM; switch it off if a game complains about memory.
 - **Turbo 250 MHz** (Ustawienia, default on): the whole system, including the XMB menu animation, runs at 250 MHz with the display clock at 62.5 MHz (`SPI_BAUD_TURBO` in `config.py` if you want another value). Switch it off if you get glitches.
 
+## Power off / wake (START)
+
+In the XMB menu hold **START for about 4 seconds** (a progress bar appears) to switch the console "off": the SD card is unmounted, the screen and backlight go off and the CPU clock drops to 20 MHz. Hold START for 4 seconds again to wake it up (the splash screen appears). The same is available in *System > Wyłącz (uśpij)*.
+
+A Pico has no real off state, so this is a low-power standby, not a power cut: a battery will still drain slowly (use a power switch for storage). Optional in `config.py`: `POWER_HOLD_MS = 4000` (hold time) and `PIN_BL = <gpio>` if your backlight is wired to a GPIO that can be switched off.
+
 ## Limits
 
 - No sound.
