@@ -3,6 +3,7 @@
 # Cala scena (tlo z falami, ikony kategorii, lista pozycji) jest skladana z poziomych
 # pasow 320x48 w jednym malym buforze RAM (30 KB) i wysylana na ekran pas po pasie.
 # Dzieki temu animacje sa plynne bez pelnego bufora ramki (150 KB, ktorego nie ma).
+import config
 import framebuf
 import gc
 import io
@@ -10,7 +11,7 @@ import math
 import sys
 import time
 
-from buttons import UP, DOWN, LEFT, RIGHT, A
+from buttons import UP, DOWN, LEFT, RIGHT, A, START
 from st7789 import rgb, pl_text
 
 STRIP = 48          # rows per strip
@@ -187,6 +188,7 @@ class XMB:
             out.append(("Informacje o systemie", tos.info, ""))
             out.append(("Karta SD", tos.sd_menu, "OK" if tos.sd else "brak"))
             out.append(("Uruchom ponownie", tos.reboot, ""))
+            out.append(("Wyłącz (uśpij)", tos.power_off, "START"))
         return out
 
     def play_rom(self, path):
@@ -334,6 +336,23 @@ class XMB:
         self.get_items(self.cat)
         self.clamp_sel()
 
+    def hold_bar(self, dt, hold):
+        """Progress bar while START is held (draws straight onto the screen)."""
+        tos = self.tos
+        w = self.W - 80
+        y = self.H - 34
+        fill = min(w, w * dt // hold)
+        tos.lcd.fill_rect(38, y - 2, w + 4, 22, self.dark)
+        tos.lcd.fill_rect(40, y + 12, w, 4, rgb(60, 80, 130))
+        tos.lcd.fill_rect(40, y + 12, fill, 4, self.white)
+        tos.lcd.text("Trzymaj START: wyłączanie", 40, y, self.white, self.dark)
+
+    def power(self):
+        self.free()
+        self.tos.power_off()
+        self.tos.btn.release()
+        self.alloc()
+
     def move(self, d):
         n = len(self.get_items(self.cat))
         self.sel[self.cat] = max(0, min(n - 1, self.sel[self.cat] + d))
@@ -350,7 +369,32 @@ class XMB:
         ipos = float(self.sel[disp])
         self.render(pos, ipos)
         btn.release()
+        hold = getattr(config, "POWER_HOLD_MS", 4000)
+        hold0 = None
+        bar = False
         while True:
+            if btn.read() & START:
+                now = time.ticks_ms()
+                if hold0 is None:
+                    hold0 = now
+                dt = time.ticks_diff(now, hold0)
+                if dt >= hold:
+                    self.power()
+                    hold0 = None
+                    bar = False
+                    pos = float(self.cat)
+                    disp = self.cat
+                    ipos = float(self.sel[disp])
+                    self.render(pos, ipos)
+                    continue
+                if dt > 700:
+                    self.hold_bar(dt, hold)
+                    bar = True
+            elif hold0 is not None:
+                hold0 = None
+                if bar:
+                    bar = False
+                    self.render(pos, ipos)
             k = btn.poll()
             if k & LEFT and self.cat > 0:
                 self.cat -= 1

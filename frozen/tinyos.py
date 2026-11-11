@@ -526,6 +526,42 @@ class System:
             s["splash"] = 0 if s.get("splash", 1) else 1
         self.save_settings()
 
+    def power_off(self):
+        """Software power off: screen and backlight off, clock down; hold START to wake up.
+        (A Pico has no real off state; this is the lowest-power state reachable from MicroPython.)"""
+        hold = getattr(config, "POWER_HOLD_MS", 4000)
+        self.sd_unmount()
+        self.clear(rgb(0, 0, 0))
+        self.ctext("Do zobaczenia!", 110, self.WHITE, rgb(0, 0, 0), 2)
+        time.sleep_ms(700)
+        bl = getattr(config, "PIN_BL", None)
+        if bl is not None:
+            Pin(bl, Pin.OUT).value(0)
+        self.lcd._cmd(0x28)            # display off
+        self.lcd._cmd(0x10)            # sleep in
+        freq(20_000_000)
+        self.btn.release()
+        t0 = None
+        while True:
+            if self.btn.read() & START:
+                if t0 is None:
+                    t0 = time.ticks_ms()
+                elif time.ticks_diff(time.ticks_ms(), t0) >= hold:
+                    break
+            else:
+                t0 = None
+            time.sleep_ms(40)
+        self.apply_clock()
+        self.lcd._cmd(0x11)            # sleep out
+        time.sleep_ms(130)
+        self.lcd._cmd(0x29)            # display on
+        if bl is not None:
+            Pin(bl, Pin.OUT).value(1)
+        self.beep()
+        self.btn.release()
+        self.splash()
+        self.sd_mount()
+
     def reboot(self):
         if self.confirm("Uruchomić konsolę ponownie?"):
             self.sd_unmount()
