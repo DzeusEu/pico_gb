@@ -29,7 +29,7 @@ Changes to those files now need a new firmware build (edit the copies in `frozen
 
 ## RTSP_OS: two ways to install the new version
 
-**A. Without rebuilding (quickest).** Upload the files from `pico_files.zip` to the Pico in Thonny (overwrite): `main.py`, `tinyos.py`, `st7789.py`, `filebrowser.py`, `xmb.py` to the root; `games/*.py`; `emulators/gb.py`, `emulators/gbc.py`. Do **not** overwrite `config.py` or `/data`. Files on the Pico override the frozen ones, so this works with any firmware, but if you have a frozen OS they use RAM again until you do path B.
+**A. Without rebuilding (quickest).** Upload the files from `pico_files.zip` to the Pico in Thonny (overwrite): `main.py`, `tinyos.py`, `st7789.py`, `filebrowser.py`, `xmb.py` to the root; `games/*.py`; `emulators/gb.py`, `emulators/gbc.py`, `emulators/nes.py`. Do **not** overwrite `config.py` or `/data`. Files on the Pico override the frozen ones, so this works with any firmware, but if you have a frozen OS they use RAM again until you do path B.
 
 **B. Rebuild the firmware.** Replace `frozen/` and `manifest.py` in your GitHub repo (the manifest now also freezes `xmb.py`), run the workflow, flash, then delete the six OS files from the Pico root (see section 3) and upload only `main.py`, `games/`, `emulators/`.
 
@@ -43,11 +43,11 @@ This writes `splash.raw` (320x240). Copy it to the Pico root (or the SD card roo
 
 ## XMB menu
 
-L/R: change category (Gry, Game Boy, Pliki, Ustawienia, System). Up/Down: choose an item. A: open. Game Boy lists the `.gb`/`.gbc` files from `/sd/roms`, `/sd` and `/roms`. Polish letters are drawn by `st7789.py` from the plain font, so no font file is needed.
+L/R: change category (Gry, Emulatory, Pliki, Ustawienia, System). Up/Down: choose an item. A: open. Emulatory lists the `.gb`/`.gbc`/`.nes` files from `/sd/roms`, `/sd` and `/roms`. Polish letters are drawn by `st7789.py` from the plain font, so no font file is needed.
 
 ## 4. Install the front-end
 
-Copy `emulators/gb.py` and `emulators/gbc.py` to `/emulators` on the Pico (flash, not the SD card).
+Copy `emulators/gb.py`, `emulators/gbc.py` and `emulators/nes.py` to `/emulators` on the Pico (flash, not the SD card).
 
 ## 5. Play
 
@@ -115,3 +115,12 @@ A Pico has no real off state, so this is a low-power standby, not a power cut: a
 - No sound.
 - Original Game Boy hardware only (see above).
 - Cartridge RAM above 32 KB is not saved.
+
+## NES (.nes)
+
+The NES emulator is the C module `nesemu` (own core, no download needed) - it needs a **firmware rebuild** (the workflow builds both `gbemu` and `nesemu`, so replace the `usermod/` folder in your repo). Then copy `emulators/nes.py` to `/emulators` and put `.nes` files in `/sd/roms`.
+
+- Mappers: 0 (NROM), 1 (MMC1), 2 (UxROM), 3 (CNROM), 4 (MMC3), 7 (AxROM), 66 (GxROM) - roughly 85% of the library. Other mappers show "Mapper N nie jest obsługiwany".
+- No sound (the APU is not emulated). Picture is 256x240, centred (no scaling).
+- Controls and the pause menu are the same as for the Game Boy (hold START 1 s). Saves go to `.sav` next to the ROM.
+- Send me the *Diagnostyka* screen from a few games so I can tune speed.

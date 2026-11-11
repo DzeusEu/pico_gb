@@ -1,4 +1,4 @@
-name: Build TinyOS firmware (MicroPython + Game Boy core)
+name: Build RTSP_OS firmware (MicroPython + Game Boy + NES cores)
 
 on:
   workflow_dispatch:
@@ -56,7 +56,7 @@ jobs:
       - name: Fetch MicroPython submodules
         run: make -C micropython/ports/rp2 BOARD=${{ inputs.board || 'RPI_PICO_W' }} submodules
 
-      - name: Build firmware with the gbemu module
+      - name: Build firmware with the gbemu + nesemu modules
         run: |
           BOARD="${{ inputs.board || 'RPI_PICO_W' }}"
           EXTRA=""

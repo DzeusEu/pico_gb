@@ -531,7 +531,7 @@ class System:
         return games
 
     def list_roms(self):
-        """[(title, path, where)] for Game Boy ROMs found on the SD card."""
+        """[(title, path, kind)] for Game Boy / NES ROMs found on the SD card."""
         out = []
         seen = set()
         for d in (SD_DIR + "/roms", SD_DIR, "/roms"):
@@ -539,9 +539,9 @@ class System:
                 for f in sorted(uos.listdir(d)):
                     e = ext_of(f)
                     p = d + "/" + f
-                    if e in ("gb", "gbc") and p not in seen:
+                    if e in ("gb", "gbc", "nes") and p not in seen:
                         seen.add(p)
-                        out.append((f.rpartition(".")[0], p, "SD" if d.startswith(SD_DIR) else ""))
+                        out.append((f.rpartition(".")[0], p, e.upper()))
             except OSError:
                 pass
         return out

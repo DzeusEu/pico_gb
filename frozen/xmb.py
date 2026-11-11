@@ -25,7 +25,7 @@ SEL_Y = 122         # y of the selected item
 ROW_H = 26
 TEXT_X = 94
 
-NAMES = ("Gry", "Game Boy", "Pliki", "Ustawienia", "System")
+NAMES = ("Gry", "Emulatory", "Pliki", "Ustawienia", "System")
 
 
 # ---------------------------------------------------------------- icon drawing
@@ -170,7 +170,7 @@ class XMB:
             for title, path, where in tos.list_roms():
                 out.append((title, (lambda p=path: self.play_rom(p)), where))
             if not out:
-                out.append(("Brak ROM-ów", (lambda: tos.message("Game Boy", "Nie znaleziono plików .gb ani .gbc. Skopiuj je do /sd/roms na karcie SD.", tos.ORANGE)), ""))
+                out.append(("Brak ROM-ów", (lambda: tos.message("Emulatory", "Nie znaleziono plików .gb, .gbc ani .nes. Skopiuj je do /sd/roms na karcie SD.", tos.ORANGE)), ""))
         elif cat == 2:
             out.append(("Pamięć wewnętrzna", (lambda: tos.browser("/")), ""))
             out.append(("Karta SD", self.open_sd, "" if tos.sd else "brak"))
@@ -194,7 +194,7 @@ class XMB:
 
     def play_rom(self, path):
         if not self.tos.launch_file(path):
-            self.tos.message("Game Boy", "Brak emulatora dla tego pliku. Skopiuj gb.py do /emulators.", self.tos.ORANGE)
+            self.tos.message("Emulatory", "Brak emulatora dla tego pliku. Skopiuj gb.py / nes.py do /emulators.", self.tos.ORANGE)
 
     def open_sd(self):
         if self.tos.sd:
