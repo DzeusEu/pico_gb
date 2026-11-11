@@ -33,6 +33,7 @@
 #include "hardware/sync.h"
 
 #define NES_HOT __attribute__((section(".time_critical.nesemu")))
+#define NES_TBL static __attribute__((section(".time_critical.nesemu_t")))   // opcode tables in RAM
 #include "nes_core.h"
 
 #define NE_UNIT 4096

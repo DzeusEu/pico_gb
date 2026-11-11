@@ -17,6 +17,9 @@
 #ifndef NES_HOT
 #define NES_HOT
 #endif
+#ifndef NES_TBL
+#define NES_TBL static const
+#endif
 
 #define NES_NOMAP 0xFFFFFFFFu
 
@@ -49,6 +52,7 @@ struct nes_s {
     bool s0_pending;
     int s0_dot;
     uint8_t lineidx[256 + 16];
+    uint8_t sprbuf[264];
 
     // ---- input
     uint8_t keys, shift;
@@ -441,6 +445,19 @@ static NES_HOT void nes_wr(nes_t *n, uint16_t a, uint8_t val) {
 // ------------------------------------------------------------------ CPU
 #include "nes_tables.h"
 
+static NES_HOT inline uint8_t nes_fetch(nes_t *n) {
+    uint16_t p = n->pc++;
+    if (p >= 0x8000) {
+        return n->prg_ptr[(p >> 12) & 7][p & 0xFFF];
+    }
+    return nes_rd(n, p);
+}
+
+static NES_HOT inline unsigned nes_fetch16(nes_t *n) {
+    unsigned lo = nes_fetch(n);
+    return lo | ((unsigned)nes_fetch(n) << 8);
+}
+
 #define F_C 0x01
 #define F_Z 0x02
 #define F_I 0x04
@@ -529,46 +546,43 @@ static NES_HOT int nes_cpu_step(nes_t *n) {
         nes_interrupt(n, 0xFFFE, false);
         return 7;
     }
-    uint8_t op = nes_rd(n, n->pc++);
+    uint8_t op = nes_fetch(n);
     int cyc = nes_op_cyc[op];
     unsigned ea = 0;
     bool cross = false;
     uint8_t mode = nes_op_mode[op];
     switch (mode) {
         case M_IMM: ea = n->pc++; break;
-        case M_ZP: ea = nes_rd(n, n->pc++); break;
-        case M_ZPX: ea = (nes_rd(n, n->pc++) + n->x) & 0xFF; break;
-        case M_ZPY: ea = (nes_rd(n, n->pc++) + n->y) & 0xFF; break;
-        case M_ABS: ea = nes_rd(n, n->pc) | (nes_rd(n, n->pc + 1) << 8); n->pc += 2; break;
+        case M_ZP: ea = nes_fetch(n); break;
+        case M_ZPX: ea = (nes_fetch(n) + n->x) & 0xFF; break;
+        case M_ZPY: ea = (nes_fetch(n) + n->y) & 0xFF; break;
+        case M_ABS: ea = nes_fetch16(n); break;
         case M_ABX: {
-            unsigned b = nes_rd(n, n->pc) | (nes_rd(n, n->pc + 1) << 8);
-            n->pc += 2;
+            unsigned b = nes_fetch16(n);
             ea = (b + n->x) & 0xFFFF;
             cross = (b & 0xFF00) != (ea & 0xFF00);
             break;
         }
         case M_ABY: {
-            unsigned b = nes_rd(n, n->pc) | (nes_rd(n, n->pc + 1) << 8);
-            n->pc += 2;
+            unsigned b = nes_fetch16(n);
             ea = (b + n->y) & 0xFFFF;
             cross = (b & 0xFF00) != (ea & 0xFF00);
             break;
         }
         case M_IZX: {
-            unsigned z = (nes_rd(n, n->pc++) + n->x) & 0xFF;
+            unsigned z = (nes_fetch(n) + n->x) & 0xFF;
             ea = n->ram[z] | (n->ram[(z + 1) & 0xFF] << 8);
             break;
         }
         case M_IZY: {
-            unsigned z = nes_rd(n, n->pc++);
+            unsigned z = nes_fetch(n);
             unsigned b = n->ram[z] | (n->ram[(z + 1) & 0xFF] << 8);
             ea = (b + n->y) & 0xFFFF;
             cross = (b & 0xFF00) != (ea & 0xFF00);
             break;
         }
         case M_IND: {
-            unsigned p = nes_rd(n, n->pc) | (nes_rd(n, n->pc + 1) << 8);
-            n->pc += 2;
+            unsigned p = nes_fetch16(n);
             ea = nes_rd(n, p) | (nes_rd(n, (p & 0xFF00) | ((p + 1) & 0xFF)) << 8);   // page wrap bug
             break;
         }
@@ -659,7 +673,7 @@ static NES_HOT int nes_cpu_step(nes_t *n) {
             nes_interrupt(n, 0xFFFE, true);
             break;
 #define BRANCH(cond) \
-    { int8_t off = (int8_t)nes_rd(n, n->pc++); \
+    { int8_t off = (int8_t)nes_fetch(n); \
       if (cond) { unsigned np = n->pc + off; cyc += 1 + (((np ^ n->pc) & 0xFF00) ? 1 : 0); n->pc = np; } }
         case I_BPL: BRANCH(!(n->p & F_N)) break;
         case I_BMI: BRANCH(n->p & F_N) break;
@@ -711,10 +725,11 @@ static void nes_init_tables(void) {
 }
 
 // Renders scanline y into n->lineidx (palette indices 0..63). Also finds the sprite 0 hit position.
+// output=false: only what the sprite 0 hit test needs (background + sprite 0).
 static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
     uint8_t *out = n->lineidx;
-    uint8_t bgbuf[256 + 16];           // 2-bit colour in bits 0-1, palette in bits 2-3
-    uint8_t sprbuf[256];               // bit7 = opaque, bit6 = behind bg, low 5 bits = palette index (16..31)
+    uint8_t bgbuf[256 + 16] __attribute__((aligned(4)));  // 2-bit colour in bits 0-1, palette in bits 2-3 (0 = transparent)
+    uint8_t *sprbuf = n->sprbuf;       // kept all-zero between lines; bit7 opaque, bit6 behind bg, low 5 bits palette index
     bool bg_on = (n->mask & 0x08) != 0;
     bool spr_on = (n->mask & 0x10) != 0;
     int hit_x = -1;
@@ -726,27 +741,36 @@ static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
         unsigned cy = (v >> 5) & 31;
         unsigned nt = (v >> 10) & 3;
         unsigned base = (n->ctrl & 0x10) ? 0x1000 : 0;
-        uint8_t *dst = bgbuf;
+        uint32_t *dst = (uint32_t *)bgbuf;
         for (int tx = 0; tx < 33; tx++) {
             const uint8_t *ntp = n->nt_ptr[nt];
             unsigned tile = ntp[(cy << 5) | cx];
-            unsigned at = ntp[0x3C0 | ((cy >> 2) << 3) | (cx >> 2)];
-            unsigned pal = (at >> (((cy & 2) << 1) | (cx & 2))) & 3;
             unsigned pa = base + tile * 16 + fine_y;
             const uint8_t *cp = n->chr_ptr[pa >> 10];
             unsigned lo = cp[pa & 0x3FF];
             unsigned hi = cp[(pa & 0x3FF) + 8];
-            unsigned bits = nes_spread[lo] | (nes_spread[hi] << 1);
-            unsigned pb = pal << 2;
-            dst[0] = ((bits >> 14) & 3) ? (((bits >> 14) & 3) | pb) : 0;
-            dst[1] = ((bits >> 12) & 3) ? (((bits >> 12) & 3) | pb) : 0;
-            dst[2] = ((bits >> 10) & 3) ? (((bits >> 10) & 3) | pb) : 0;
-            dst[3] = ((bits >> 8) & 3) ? (((bits >> 8) & 3) | pb) : 0;
-            dst[4] = ((bits >> 6) & 3) ? (((bits >> 6) & 3) | pb) : 0;
-            dst[5] = ((bits >> 4) & 3) ? (((bits >> 4) & 3) | pb) : 0;
-            dst[6] = ((bits >> 2) & 3) ? (((bits >> 2) & 3) | pb) : 0;
-            dst[7] = (bits & 3) ? ((bits & 3) | pb) : 0;
-            dst += 8;
+            if ((lo | hi) == 0) {
+                dst[0] = 0;
+                dst[1] = 0;
+            } else {
+                unsigned at = ntp[0x3C0 | ((cy >> 2) << 3) | (cx >> 2)];
+                unsigned pb = ((at >> (((cy & 2) << 1) | (cx & 2))) & 3) << 2;
+                unsigned bits = nes_spread[lo] | (nes_spread[hi] << 1);
+                // 8 pixels -> 8 bytes; a pixel with colour 0 stays 0 (transparent)
+                uint32_t w0 = 0, w1 = 0;
+                unsigned c;
+                c = (bits >> 14) & 3; w0 |= c ? (c | pb) : 0;
+                c = (bits >> 12) & 3; w0 |= (c ? (c | pb) : 0) << 8;
+                c = (bits >> 10) & 3; w0 |= (c ? (c | pb) : 0) << 16;
+                c = (bits >> 8) & 3;  w0 |= (c ? (c | pb) : 0) << 24;
+                c = (bits >> 6) & 3;  w1 |= c ? (c | pb) : 0;
+                c = (bits >> 4) & 3;  w1 |= (c ? (c | pb) : 0) << 8;
+                c = (bits >> 2) & 3;  w1 |= (c ? (c | pb) : 0) << 16;
+                c = bits & 3;         w1 |= (c ? (c | pb) : 0) << 24;
+                dst[0] = w0;
+                dst[1] = w1;
+            }
+            dst += 2;
             if (++cx == 32) {
                 cx = 0;
                 nt ^= 1;
@@ -760,27 +784,33 @@ static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
     } else {
         memset(bgbuf, 0, sizeof bgbuf);
     }
+    const uint8_t *bgp = bgbuf + n->fine_x;
 
+    // ---- sprites
+    int found = 0;
+    int idx_list[8];
     if (spr_on) {
-        memset(sprbuf, 0, sizeof sprbuf);
         int h = (n->ctrl & 0x20) ? 16 : 8;
-        int found = 0;
-        uint8_t s0mask[256 / 8 + 1];
-        bool s0_here = false;
-        int idx_list[8];
-        for (int i = 0; i < 64; i++) {
-            int sy = n->oam[i * 4] + 1;
-            int row = y - sy;
-            if (row >= 0 && row < h) {
-                if (found < 8) {
-                    idx_list[found++] = i;
-                } else {
-                    n->status |= 0x20;
-                    break;
+        if (output) {
+            for (int i = 0; i < 64; i++) {
+                int row = y - (n->oam[i * 4] + 1);
+                if (row >= 0 && row < h) {
+                    if (found < 8) {
+                        idx_list[found++] = i;
+                    } else {
+                        n->status |= 0x20;
+                        break;
+                    }
                 }
             }
+        } else {
+            int row = y - (n->oam[0] + 1);
+            if (row >= 0 && row < h) {
+                idx_list[found++] = 0;
+            }
         }
-        memset(s0mask, 0, sizeof s0mask);
+        bool clip = !(n->mask & 0x04);
+        bool s0_check = !(n->status & 0x40) && bg_on;
         for (int k = found - 1; k >= 0; k--) {
             int i = idx_list[k];
             int sy = n->oam[i * 4] + 1;
@@ -800,42 +830,25 @@ static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
             const uint8_t *cp = n->chr_ptr[pa >> 10];
             unsigned lo = cp[pa & 0x3FF];
             unsigned hi = cp[(pa & 0x3FF) + 8];
+            if ((lo | hi) == 0) {
+                continue;
+            }
             unsigned bits = nes_spread[lo] | (nes_spread[hi] << 1);
             unsigned palbase = 16 + ((attr & 3) << 2);
+            uint8_t flags = 0x80 | ((attr & 0x20) ? 0x40 : 0);
             for (int px = 0; px < 8; px++) {
-                int sh = (attr & 0x40) ? (2 * px) : (14 - 2 * px);
-                unsigned c = (bits >> sh) & 3;
-                if (!c) {
-                    continue;
-                }
                 int x = sx + px;
                 if (x > 255) {
                     break;
                 }
-                sprbuf[x] = 0x80 | ((attr & 0x20) ? 0x40 : 0) | (palbase + c);
-                if (i == 0) {
-                    s0mask[x >> 3] |= 1 << (x & 7);
-                    s0_here = true;
-                }
-            }
-        }
-        if (s0_here && !(n->status & 0x40)) {
-            for (int x = 0; x < 255; x++) {
-                if (!(s0mask[x >> 3] & (1 << (x & 7)))) {
+                unsigned c = (bits >> ((attr & 0x40) ? (2 * px) : (14 - 2 * px))) & 3;
+                if (!c || (clip && x < 8)) {
                     continue;
                 }
-                if (x < 8 && (!(n->mask & 0x02) || !(n->mask & 0x04))) {
-                    continue;
-                }
-                if (bgbuf[n->fine_x + x] & 3) {
+                sprbuf[x] = flags | (palbase + c);
+                if (i == 0 && hit_x < 0 && s0_check && x < 255 && (bgp[x] & 3)) {
                     hit_x = x;
-                    break;
                 }
-            }
-        }
-        if (!(n->mask & 0x04)) {
-            for (int x = 0; x < 8; x++) {
-                sprbuf[x] = 0;
             }
         }
     }
@@ -844,6 +857,12 @@ static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
         n->s0_dot = hit_x + 4;
     }
     if (!output) {
+        for (int k = 0; k < found; k++) {          // restore the all-zero invariant
+            int sx = n->oam[idx_list[k] * 4 + 3];
+            for (int px = 0; px < 8 && sx + px < 256; px++) {
+                sprbuf[sx + px] = 0;
+            }
+        }
         return;
     }
 
@@ -854,21 +873,33 @@ static NES_HOT void nes_render_line(nes_t *n, int y, bool output) {
         memset(out, back, 256);
         return;
     }
-    const uint8_t *bgp = bgbuf + n->fine_x;
-    if (spr_on) {
-        for (int x = 0; x < 256; x++) {
-            unsigned b = bgp[x];
-            unsigned s = sprbuf[x];
-            if (s && (!(s & 0x40) || !(b & 3))) {
-                out[x] = pal[s & 0x1F] & grey;
-            } else {
-                out[x] = b ? (pal[b] & grey) : back;
+    uint8_t pl[16];
+    pl[0] = back;
+    for (int i = 1; i < 16; i++) {
+        pl[i] = (i & 3) ? (pal[i] & grey) : back;
+    }
+    for (int x = 0; x < 256; x += 4) {
+        out[x] = pl[bgp[x]];
+        out[x + 1] = pl[bgp[x + 1]];
+        out[x + 2] = pl[bgp[x + 2]];
+        out[x + 3] = pl[bgp[x + 3]];
+    }
+    if (found) {
+        for (int k = 0; k < found; k++) {
+            int sx = n->oam[idx_list[k] * 4 + 3];
+            for (int px = 0; px < 8 && sx + px < 256; px++) {
+                int x = sx + px;
+                unsigned s = sprbuf[x];
+                if (s && (!(s & 0x40) || !(bgp[x] & 3))) {
+                    out[x] = pal[s & 0x1F] & grey;
+                }
             }
         }
-    } else {
-        for (int x = 0; x < 256; x++) {
-            unsigned b = bgp[x];
-            out[x] = b ? (pal[b] & grey) : back;
+        for (int k = 0; k < found; k++) {
+            int sx = n->oam[idx_list[k] * 4 + 3];
+            for (int px = 0; px < 8 && sx + px < 256; px++) {
+                sprbuf[sx + px] = 0;
+            }
         }
     }
 }
@@ -992,7 +1023,8 @@ static NES_HOT void nes_frame(nes_t *n, uint8_t keys, bool draw) {
         }
         n->s0_pending = false;
         if (line < 240) {
-            bool need_s0 = !(n->status & 0x40) && (n->mask & 0x10);
+            int s0row = line - (n->oam[0] + 1);
+            bool need_s0 = !(n->status & 0x40) && (n->mask & 0x18) == 0x18 && s0row >= 0 && s0row < ((n->ctrl & 0x20) ? 16 : 8);
             if (draw || (need_s0 && rendering)) {
                 nes_render_line(n, line, draw);
                 if (draw && n->line_cb) {
