@@ -38,7 +38,8 @@
 
 #define NE_UNIT 4096
 #define NE_USHIFT 12
-#define NE_SLOTB (NE_UNIT + 512)    // slot block: data at +16 so a 9-sector read lands aligned
+#define NE_SLOTB NE_UNIT            // one cache slot
+#define NE_TMPB (NE_UNIT + 512)     // shared buffer for the 9-sector SD read (data starts at +16)
 #define NE_DOFF 16
 #define NE_MAXS 120
 #define NE_STRIP 8                  // lines per display strip
@@ -63,6 +64,7 @@ typedef struct _ne_obj_t {
     const mp_stream_p_t *stream;
     uint32_t file_size, hdr_bytes, nunits_prg, nunits;
     uint8_t **slot_buf;
+    uint8_t *tmp;
     int nslots;
     int32_t *slot_unit;
     uint32_t *slot_use, *slot_pin;
@@ -200,7 +202,8 @@ static inline uint32_t ne_sec_of(ne_obj_t *self, uint32_t fs) {
 }
 
 // read unit `u` into a slot block (data lands at block + 16); false -> use the normal path
-static bool ne_sd_unit(ne_obj_t *self, uint32_t u, uint8_t *blk) {
+static bool ne_sd_unit(ne_obj_t *self, uint32_t u, uint8_t *dst) {
+    uint8_t *blk = self->tmp;
     uint32_t s0 = (self->hdr_bytes >> 9) + u * 8;
     uint32_t total = (self->file_size + 511) >> 9;
     if (s0 >= total) {
@@ -230,6 +233,7 @@ static bool ne_sd_unit(ne_obj_t *self, uint32_t u, uint8_t *blk) {
         uint32_t have = off < avail ? avail - off : 0;
         memset(blk + NE_DOFF + have, 0xFF, NE_UNIT - have);
     }
+    memcpy(dst, blk + NE_DOFF, NE_UNIT);
     return true;
 }
 
@@ -264,7 +268,7 @@ static uint8_t *ne_load_unit(ne_obj_t *self, uint32_t u) {
         uint8_t *blk = self->slot_buf[slot];
         if (!(self->sd_ok && ne_sd_unit(self, u, blk))) {
             self->sd_ok = false;
-            ne_read_at(self, self->hdr_bytes + (u << NE_USHIFT), blk + NE_DOFF, NE_UNIT);
+            ne_read_at(self, self->hdr_bytes + (u << NE_USHIFT), blk, NE_UNIT);
         }
         self->st_load_us += mp_hal_ticks_us() - t0;
         self->st_loads++;
@@ -273,7 +277,7 @@ static uint8_t *ne_load_unit(ne_obj_t *self, uint32_t u) {
     }
     self->slot_use[slot] = ++self->tick;
     self->slot_pin[slot] = self->epoch;
-    return self->slot_buf[slot] + NE_DOFF;
+    return self->slot_buf[slot];
 }
 
 // Called by the core after every bank switch: point all windows into cache slots.
@@ -504,6 +508,13 @@ static mp_obj_t ne_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_k
         mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("mapper %d not supported"), (int)n->mapper);
     }
     self->hdr_bytes = 16 + trainer;
+    {
+        bool wram = n->battery || n->mapper == 1 || n->mapper == 4;
+        n->prg_ram = m_new(uint8_t, wram ? 8192 : 16);
+        memset(n->prg_ram, 0, wram ? 8192 : 16);
+        n->ram_mask = wram ? 0x1FFF : 0x0F;
+        self->tmp = m_new(uint8_t, NE_TMPB);
+    }
     if (self->hdr_bytes + n->prg_size + n->chr_size > self->file_size) {
         // truncated dump: clamp (missing bytes read as 0xFF)
     }
@@ -628,8 +639,8 @@ static mp_obj_t ne_sd_direct(size_t n_args, const mp_obj_t *args) {
         uint32_t cmp = (off + NE_UNIT <= avail) ? NE_UNIT : (off < avail ? avail - off : 0);
         ok = ne_sd_unit(self, chk[k], self->slot_buf[0]);
         if (ok) {
-            ne_read_at(self, self->hdr_bytes + off, self->slot_buf[1] + NE_DOFF, NE_UNIT);
-            ok = memcmp(self->slot_buf[0] + NE_DOFF, self->slot_buf[1] + NE_DOFF, cmp) == 0;
+            ne_read_at(self, self->hdr_bytes + off, self->slot_buf[1], NE_UNIT);
+            ok = memcmp(self->slot_buf[0], self->slot_buf[1], cmp) == 0;
         }
     }
     self->sd_ok = ok;
@@ -759,7 +770,7 @@ static mp_obj_t ne_ram(mp_obj_t self_in) {
     if (!self->nes->battery) {
         return mp_const_none;
     }
-    return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW, sizeof(self->nes->prg_ram), self->nes->prg_ram);
+    return mp_obj_new_memoryview('B' | MP_OBJ_ARRAY_TYPECODE_FLAG_RW, 8192, self->nes->prg_ram);
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(ne_ram_obj, ne_ram);
 

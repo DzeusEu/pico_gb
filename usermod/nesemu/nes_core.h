@@ -36,7 +36,8 @@ struct nes_s {
     bool irq;                 // mapper IRQ line
     int32_t stall;            // extra CPU cycles (OAM DMA)
     uint8_t ram[2048];
-    uint8_t prg_ram[8192];
+    uint8_t *prg_ram;          // set by the host (8 KB, or 16 bytes when the cartridge has no work RAM)
+    uint16_t ram_mask;
     uint8_t open_bus;
 
     // ---- PPU
@@ -371,7 +372,7 @@ static NES_HOT uint8_t nes_rd(nes_t *n, uint16_t a) {
         return 0x40 | r;
     }
     if (a >= 0x6000) {
-        return n->prg_ram[a - 0x6000];
+        return n->prg_ram[(a - 0x6000) & n->ram_mask];
     }
     return 0;
 }
@@ -435,8 +436,8 @@ static NES_HOT void nes_wr(nes_t *n, uint16_t a, uint8_t val) {
             n->shift = n->keys;
         }
     } else if (a >= 0x6000) {
-        if (n->prg_ram[a - 0x6000] != val) {
-            n->prg_ram[a - 0x6000] = val;
+        if (n->prg_ram[(a - 0x6000) & n->ram_mask] != val) {
+            n->prg_ram[(a - 0x6000) & n->ram_mask] = val;
             n->ram_dirty = true;
         }
     }

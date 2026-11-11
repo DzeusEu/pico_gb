@@ -16,9 +16,10 @@ FRAME_US = 16639            # 60.10 Hz
 OC_HZ = 250_000_000
 FAST_SPI = 62_500_000
 
-CORE_BYTES = 40 * 1024      # nes_t (~21 KB) + emulator code that runs from RAM
-RESERVE = 30 * 1024        # menus / diagnostics need several 4 KB blocks of free RAM
-SLOT_BYTES = 4608 + 8       # one 4 KB ROM cache unit
+CORE_BYTES = 28 * 1024      # nes_t + SD buffer + work RAM + small tables (the code itself lives outside the Python heap)
+RESERVE = 12 * 1024
+SPARE = 6 * 1024            # contiguous block released while the pause menu / diagnostics draw text
+SLOT_BYTES = 4096 + 8       # one 4 KB ROM cache unit
 STRIP_BYTES = 4096          # one display strip (8 lines of 256 pixels)
 MIN_SLOTS = 20
 
@@ -101,6 +102,10 @@ def run(tos, path=None):
     tos.clear(tos.BLACK)
     tos.ctext("Wczytywanie...", 110, tos.WHITE, tos.BLACK)
     gc.collect()
+    try:
+        spare = [bytearray(SPARE)]
+    except MemoryError:
+        spare = []
     f = open(path, "rb")
     emu = None
     has_ram = False
@@ -117,7 +122,7 @@ def run(tos, path=None):
             return
         try:
             avail = gc.mem_free() - CORE_BYTES - RESERVE - 2 * units
-            want = max(2, min(8, getattr(config, "NES_STRIPS", 3)))
+            want = max(2, min(8, getattr(config, "NES_STRIPS", 2)))
             strips = want
             while strips > 2 and (avail - (strips - 2) * STRIP_BYTES) // SLOT_BYTES < min(units, 32):
                 strips -= 1
@@ -190,6 +195,17 @@ def run(tos, path=None):
                 clocked = False
 
         def pause_menu():
+            spare.clear()
+            gc.collect()
+            try:
+                return _pause()
+            finally:
+                try:
+                    spare.append(bytearray(SPARE))
+                except MemoryError:
+                    pass
+
+        def _pause():
             emu.sync()
             tos.lcd.spi.init(baudrate=config.SPI_BAUD)
             sel = 0

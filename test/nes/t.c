@@ -11,7 +11,7 @@ int main(int argc,char**argv){
   FILE*f=fopen(argv[1],"rb"); uint8_t h[16]; fread(h,1,16,f);
   static nes_t N; uint32_t tr; int r=nes_load_header(&N,h,&tr); if(r){printf("hdr %d\n",r);return 1;}
   prg=malloc(N.prg_size); fread(prg,1,N.prg_size,f); chr=malloc(N.chr_size?N.chr_size:1); fread(chr,1,N.chr_size,f);
-  N.remap=remap; N.line_cb=lcb; nes_cart_init(&N);
+  N.prg_ram=malloc(8192); N.ram_mask=0x1FFF; N.remap=remap; N.line_cb=lcb; nes_cart_init(&N);
   int frames=atoi(argv[2]);
   for(int i=0;i<frames;i++) nes_frame(&N,0,i==frames-1);
   printf("pc=%04x a=%02x x=%02x y=%02x ram0..7:",N.pc,N.a,N.x,N.y); for(int i=0;i<8;i++)printf(" %02x",N.ram[i]); printf("\n");
