@@ -68,6 +68,8 @@ typedef struct _ne_obj_t {
     uint32_t *slot_use, *slot_pin;
     uint16_t *utab;           // unit -> slot + 1
     uint32_t tick, epoch;
+    uint32_t win_off[16];     // offset each window was last resolved for (0xFFFFFFFF = none)
+    int16_t win_slot[16];
     bool frame_skip, skip_phase;
     bool draw_on;
     uint16_t lut[64];
@@ -275,20 +277,41 @@ static uint8_t *ne_load_unit(ne_obj_t *self, uint32_t u) {
 }
 
 // Called by the core after every bank switch: point all windows into cache slots.
+// Windows whose bank did not change only get their slot re-pinned (MMC3 games switch banks
+// many times per frame, so this must stay cheap).
 static void ne_remap(nes_t *n) {
     ne_obj_t *self = (ne_obj_t *)n->user;
     self->epoch++;
+    uint32_t ep = self->epoch;
     for (int i = 0; i < 8; i++) {
-        uint32_t u = n->prg_off[i] >> NE_USHIFT;
-        n->prg_ptr[i] = ne_load_unit(self, u) + (n->prg_off[i] & (NE_UNIT - 1));
-    }
-    for (int i = 0; i < 8; i++) {
-        if (n->chr_off[i] == NES_NOMAP) {
+        uint32_t off = n->prg_off[i];
+        if (off == self->win_off[i] && self->win_slot[i] >= 0 && self->slot_unit[self->win_slot[i]] == (int32_t)(off >> NE_USHIFT)) {
+            self->slot_pin[self->win_slot[i]] = ep;
+            self->slot_use[self->win_slot[i]] = ++self->tick;
             continue;
         }
+        uint8_t *p = ne_load_unit(self, off >> NE_USHIFT);
+        n->prg_ptr[i] = p + (off & (NE_UNIT - 1));
+        self->win_off[i] = off;
+        self->win_slot[i] = (int16_t)(self->utab[off >> NE_USHIFT] - 1);
+    }
+    for (int i = 0; i < 8; i++) {
         uint32_t off = n->chr_off[i];
+        if (off == NES_NOMAP) {
+            self->win_off[8 + i] = NES_NOMAP;
+            self->win_slot[8 + i] = -1;
+            continue;
+        }
         uint32_t u = self->nunits_prg + (off >> NE_USHIFT);
-        n->chr_ptr[i] = ne_load_unit(self, u) + (off & (NE_UNIT - 1));
+        if (off == self->win_off[8 + i] && self->win_slot[8 + i] >= 0 && self->slot_unit[self->win_slot[8 + i]] == (int32_t)u) {
+            self->slot_pin[self->win_slot[8 + i]] = ep;
+            self->slot_use[self->win_slot[8 + i]] = ++self->tick;
+            continue;
+        }
+        uint8_t *p = ne_load_unit(self, u);
+        n->chr_ptr[i] = p + (off & (NE_UNIT - 1));
+        self->win_off[8 + i] = off;
+        self->win_slot[8 + i] = (int16_t)(self->utab[u] - 1);
     }
 }
 
@@ -537,6 +560,10 @@ static mp_obj_t ne_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_k
         self->slot_pin[i] = 0;
     }
     self->epoch = 1;
+    for (int i = 0; i < 16; i++) {
+        self->win_off[i] = 0xFFFFFFFFu;
+        self->win_slot[i] = -1;
+    }
 
     n->remap = ne_remap;
     n->line_cb = ne_line;
@@ -606,6 +633,9 @@ static mp_obj_t ne_sd_direct(size_t n_args, const mp_obj_t *args) {
         }
     }
     self->sd_ok = ok;
+    for (int i = 0; i < 16; i++) {
+        self->win_off[i] = 0xFFFFFFFFu;
+    }
     ne_remap(self->nes);   // windows may have pointed into the scratch slots
     return mp_obj_new_bool(ok);
 }

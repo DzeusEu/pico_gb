@@ -17,7 +17,7 @@ OC_HZ = 250_000_000
 FAST_SPI = 62_500_000
 
 CORE_BYTES = 40 * 1024      # nes_t (~21 KB) + emulator code that runs from RAM
-RESERVE = 14 * 1024
+RESERVE = 30 * 1024        # menus / diagnostics need several 4 KB blocks of free RAM
 SLOT_BYTES = 4608 + 8       # one 4 KB ROM cache unit
 STRIP_BYTES = 4096          # one display strip (8 lines of 256 pixels)
 MIN_SLOTS = 20
